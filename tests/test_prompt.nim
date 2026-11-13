@@ -122,6 +122,7 @@ suite "the seat observation":
     check "PROMPTFROMOPERATOR" in text
     check "GUIDANCE FROM YOUR OPERATOR" in text
     check "\"script\"" in text
+    check "compact (~15-50 lines)" in text
     check $MaxScriptLines in text
     check $MaxNotesLen in text
 
@@ -133,8 +134,21 @@ suite "the seat observation":
     check "blue" in text
     for needle in ["check(dx, dy)", "who(dx, dy)", "BOMBCOST", "gridSize",
         "MAXFUSE", "while true:", "TICK RESOLUTION ORDER", "roundScore",
-        "ARRAY OF LINES", "must begin with the character {"]:
+        "ARRAY OF LINES", "compact (~15-50 lines)",
+        "must begin with the character {"]:
       check needle in text
+
+  test "extractJsonObject stops at the first balanced object despite trailing braces or string braces":
+    let trailingBraces =
+      "{\"script\": [\"# close } and quote \\\"}\\\"\", \"while true:\", \"  place()\"], " &
+      "\"notes\": \"avoid {traps} and }\", \"banner\": \"go {east}\"}\n" &
+      "Trailing commentary mentioning {extra: 1} and a stray }."
+    let parsed = parseSubmission(extractJsonObject(trailingBraces))
+    check parsed.script.len == 3
+    check parsed.notes == "avoid {traps} and }"
+    check parsed.banner == "go {east}"
+    expect GridWarsError:
+      discard extractJsonObject("{\"script\": [\"while true:\"")
 
   test "round 1 shows the sentry seed script and no diagnostics":
     let sim = initSim(fixture())

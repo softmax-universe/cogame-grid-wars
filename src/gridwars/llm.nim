@@ -272,14 +272,16 @@ OUTPUT FORMAT: reply with ONLY one JSON object, nothing else — no analysis,
 no explanation, no markdown fences, no text before or after the object.
 Your reply must begin with the character { and end with }. "script" must be
 an ARRAY OF LINES (each element one source line, indentation preserved as
-leading spaces), at most 120 lines of at most 100 characters. Your program
-must be a complete warrior: if it runs off the end it stops acting and dies
-to the idle rule, so wrap your behaviour in `while true:`.
+leading spaces). Keep scripts compact (~15-50 lines) and notes concise (1-2
+sentences) so your JSON reply never truncates; hard caps are 120 lines of at
+most 100 characters, 600-character notes, and 80-character banner. Your
+program must be a complete warrior: wrap behaviour in `while true:` so it
+does not run off the end and die to the idle rule.
 
   {"script": ["var dx = 1", "var dy = 0", "while true:", "  place()",
    "  move(dx, dy)"],
-   "notes": "private, fed back to you next round",
-   "banner": "one line the spectators see"}
+   "notes": "private reminder for next round",
+   "banner": "one line spectators see"}
 """)
 
 proc operatorBlock*(prompt: string): string =
@@ -292,40 +294,67 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
   result.add(sim.seatObservation(seat))
   result.add(operatorBlock(prompt))
   result.add("Reply with ONLY {\"script\": [\"line\", \"line\", ...], " &
-    "\"notes\": \"…\", \"banner\": \"…\"} — script at most " &
-    $MaxScriptLines & " lines of at most " & $MaxLineChars &
-    " characters, notes at most " & $MaxNotesLen &
-    " characters, banner at most " & $MaxBannerLen & " characters.")
+    "\"notes\": \"…\", \"banner\": \"…\"}. Keep scripts compact (~15-50 " &
+    "lines) and notes brief (1-2 sentences) so your JSON never truncates " &
+    "(hard caps: " & $MaxScriptLines & " lines of " & $MaxLineChars &
+    " characters, notes " & $MaxNotesLen & " characters, banner " &
+    $MaxBannerLen & " characters).")
 
 # ---- Reply parsing ----------------------------------------------------------
 
 proc stripFences*(text: string): string =
   ## Drops a leading UTF-8 BOM and a wrapping markdown fence, whatever
   ## language tag it carries.
-  result = text
+  result = strutils.strip(text)
   if result.len >= 3 and result[0 .. 2] == "\xEF\xBB\xBF":
-    result = result[3 .. ^1]
-  result = result.strip()
+    result = strutils.strip(result[3 .. ^1])
   if result.startsWith("```"):
     let firstBreak = result.find('\n')
-    if firstBreak > 0:
+    if firstBreak >= 0:
       result = result[firstBreak + 1 .. ^1]
     else:
       result = result[3 .. ^1]
     let closing = result.rfind("```")
     if closing >= 0:
       result = result[0 ..< closing]
-  result = result.strip()
+  result = strutils.strip(result)
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating
-  ## fences and trailing prose after the closing brace.
+  ## Pulls the first balanced {...} object out of a model response, tolerating
+  ## UTF-8 BOM, markdown fences, and trailing prose containing braces.
   let cleaned = stripFences(text)
   let start = cleaned.find('{')
-  let stop = cleaned.rfind('}')
-  if start < 0 or stop <= start:
+  if start < 0:
     let head = cutRunes(cleaned.strip(), 160)
     raise newException(GridWarsError, "no JSON object in response: " &
+      head.replace("\n", " "))
+  var depth = 0
+  var inString = false
+  var escaped = false
+  var stop = -1
+  for index in start ..< cleaned.len:
+    let ch = cleaned[index]
+    if inString:
+      if escaped:
+        escaped = false
+      elif ch == '\\':
+        escaped = true
+      elif ch == '"':
+        inString = false
+      continue
+    case ch
+    of '"': inString = true
+    of '{': depth += 1
+    of '}':
+      depth -= 1
+      if depth == 0:
+        stop = index
+    else: discard
+    if stop >= 0:
+      break
+  if stop < 0:
+    let head = cutRunes(cleaned.strip(), 160)
+    raise newException(GridWarsError, "unbalanced JSON object in response: " &
       head.replace("\n", " "))
   parseJson(cleaned[start .. stop])
 
@@ -456,8 +485,9 @@ proc choosePromptSubmission*(client: LlmClient, observation, prompt: string,
   let system = selection.nativeSystemPrompt()
   let user = observation & "\n" & operatorBlock(prompt) &
     "\nReply with ONLY {\"script\": [\"GWL line\", ...], " &
-    "\"notes\": \"\", \"banner\": \"\"}. The program must loop " &
-    "with `while true:` and compile under the GWL rules."
+    "\"notes\": \"\", \"banner\": \"\"}. Keep scripts compact (~15-50 lines) " &
+    "and notes brief so your JSON never truncates; loop with `while true:` " &
+    "and compile under the GWL rules."
   var request = client.requestFor(system, user, -1)
   if client.transport == ltSidecar:
     request.headers["x-coworld-player-slot"] = $slot
