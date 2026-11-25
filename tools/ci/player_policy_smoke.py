@@ -168,11 +168,17 @@ def run_aborted_episode(scratch: Path, config: dict, player_specs: list[tuple[in
         failure_path = scratch / "player_failure.json"
         assert failure_path.exists(), f"missing player_failure.json\n{(scratch / 'game.log').read_text()}"
         failure = json.loads(failure_path.read_text())
-        assert failure["failed"] is True, failure
+        assert set(failure.keys()) == {"failed_policy_index", "kind", "message"}, failure
+        assert isinstance(failure["failed_policy_index"], int) and not isinstance(failure["failed_policy_index"], bool), failure
+        assert failure["failed_policy_index"] >= 0, failure
+        assert failure["kind"] in ("player_error", "episode_inconclusive"), failure
+        assert isinstance(failure["message"], str) and 1 <= len(failure["message"]) <= 2000, failure
         replay = json.loads((scratch / "replay.json").read_text())
         assert "results" not in replay, f"aborted replay must not contain numeric results: {replay.keys()}"
-        assert replay["failure"] == failure, replay
-        return failure, player_rcs
+        diagnostics = replay.get("failure")
+        assert isinstance(diagnostics, dict) and diagnostics.get("failed") is True, replay
+        assert diagnostics.get("seat") == failure["failed_policy_index"], (diagnostics, failure)
+        return failure, diagnostics, player_rcs
     finally:
         for process in [*players, game]:
             if process.poll() is None:
@@ -276,9 +282,9 @@ with tempfile.TemporaryDirectory(prefix="gridwars-policy-") as scratch:
             assert captured["banner"] == sub.get("banner", ""), (captured, sub)
         print("Grid Wars player smoke: 2 canned, 2 prompt (bare + fenced), 4 scripted programs, zero fallback")
 
-        # Episode 2: invalid/ambiguous model output (two JSON objects) -> model_action abort, no results.json
+        # Episode 2: invalid/ambiguous model output (two JSON objects) -> player_error abort, no results.json
         stub_mode["slot3"] = "ambiguous"
-        failure_invalid, rcs_invalid = run_aborted_episode(
+        failure_invalid, diag_invalid, rcs_invalid = run_aborted_episode(
             root / "invalid_action",
             config,
             [
@@ -288,15 +294,17 @@ with tempfile.TemporaryDirectory(prefix="gridwars-policy-") as scratch:
                 (3, {"PLAYER_PROMPT": "Ambiguous reply."}, True),
             ],
         )
-        assert failure_invalid["failure_class"] == "model_action", failure_invalid
-        assert failure_invalid["kind"] == "invalid_action", failure_invalid
-        assert failure_invalid["seat"] == 3, failure_invalid
+        assert failure_invalid["kind"] == "player_error", failure_invalid
+        assert failure_invalid["failed_policy_index"] == 3, failure_invalid
+        assert diag_invalid["failure_class"] == "model_action", diag_invalid
+        assert diag_invalid["kind"] == "invalid_action", diag_invalid
+        assert diag_invalid["seat"] == 3, diag_invalid
         assert rcs_invalid[3] != 0 and rcs_invalid[:3] == [0, 0, 0], rcs_invalid
-        print("Grid Wars invalid-action smoke: ambiguous reply aborted unscored with model_action failure")
+        print("Grid Wars invalid-action smoke: ambiguous reply aborted unscored with player_error failure")
 
-        # Episode 3: provider HTTP 503 failure -> infrastructure abort, no results.json
+        # Episode 3: provider HTTP 503 failure -> episode_inconclusive abort, no results.json
         stub_mode["slot3"] = "provider_error"
-        failure_provider, rcs_provider = run_aborted_episode(
+        failure_provider, diag_provider, rcs_provider = run_aborted_episode(
             root / "provider_error",
             config,
             [
@@ -306,14 +314,17 @@ with tempfile.TemporaryDirectory(prefix="gridwars-policy-") as scratch:
                 (3, {"PLAYER_PROMPT": "Provider failure."}, True),
             ],
         )
-        assert failure_provider["failure_class"] == "infrastructure", failure_provider
-        assert failure_provider["kind"] == "provider_error", failure_provider
-        assert failure_provider["seat"] == 3, failure_provider
+        assert failure_provider["kind"] == "episode_inconclusive", failure_provider
+        assert failure_provider["failed_policy_index"] == 3, failure_provider
+        assert "503" in failure_provider["message"], failure_provider
+        assert diag_provider["failure_class"] == "infrastructure", diag_provider
+        assert diag_provider["kind"] == "provider_error", diag_provider
+        assert diag_provider["seat"] == 3, diag_provider
         assert rcs_provider[3] != 0 and rcs_provider[:3] == [0, 0, 0], rcs_provider
-        print("Grid Wars provider-error smoke: HTTP 503 aborted unscored with infrastructure failure")
+        print("Grid Wars provider-error smoke: HTTP 503 aborted unscored with episode_inconclusive failure")
 
-        # Episode 4: missing credentials -> infrastructure abort, no results.json
-        failure_creds, rcs_creds = run_aborted_episode(
+        # Episode 4: missing credentials -> episode_inconclusive abort, no results.json
+        failure_creds, diag_creds, rcs_creds = run_aborted_episode(
             root / "missing_creds",
             config,
             [
@@ -323,11 +334,13 @@ with tempfile.TemporaryDirectory(prefix="gridwars-policy-") as scratch:
                 (3, {"PLAYER_SCRIPTED": "painter"}, False),
             ],
         )
-        assert failure_creds["failure_class"] == "infrastructure", failure_creds
-        assert failure_creds["kind"] == "missing_credentials", failure_creds
-        assert failure_creds["seat"] == 2, failure_creds
+        assert failure_creds["kind"] == "episode_inconclusive", failure_creds
+        assert failure_creds["failed_policy_index"] == 2, failure_creds
+        assert diag_creds["failure_class"] == "infrastructure", diag_creds
+        assert diag_creds["kind"] == "missing_credentials", diag_creds
+        assert diag_creds["seat"] == 2, diag_creds
         assert rcs_creds[2] != 0 and rcs_creds[0] == 0 and rcs_creds[1] == 0 and rcs_creds[3] == 0, rcs_creds
-        print("Grid Wars missing-credentials smoke: aborted unscored with infrastructure failure")
+        print("Grid Wars missing-credentials smoke: aborted unscored with episode_inconclusive failure")
     finally:
         for process in [*players, game]:
             if process.poll() is None:

@@ -179,19 +179,43 @@ proc failureJson(gs: GameState): JsonNode =
   if not gs.failure.rejectedAction.isNil:
     result["rejected_action"] = gs.failure.rejectedAction
 
+proc playerFailureKind(failure: EpisodeFailure): string =
+  if failure.failureClass == "model_action": "player_error"
+  else: "episode_inconclusive"
+
+proc playerFailureJson(gs: GameState): JsonNode =
+  ## Coworld GamePlayerFailure closed JSON schema: ONLY failed_policy_index,
+  ## kind ("player_error" | "episode_inconclusive"), and message (1..2000 chars).
+  ## Returns nil when no concrete player seat can be attributed.
+  if not gs.failure.active or gs.failure.seat < 0 or
+      gs.failure.seat >= gs.config.players.len:
+    return nil
+  let detail = gs.failure.reason.strip()
+  let rawMessage =
+    if detail.len > 0: detail
+    elif gs.failure.kind.len > 0: gs.failure.kind
+    else: "player failure"
+  %*{
+    "failed_policy_index": gs.failure.seat,
+    "kind": playerFailureKind(gs.failure),
+    "message": cleanText(rawMessage, 2000)
+  }
+
 proc abortEpisode(runtimeConfig: RuntimeConfig) =
   ## Terminates an unfinished episode cleanly without authoritative gameplay
   ## scores or winner, recording the failure cause to COGAME_PLAYER_FAILURE_URI.
-  var failurePayload: JsonNode
+  var failureDiagnostics: JsonNode
+  var playerFailurePayload: JsonNode
   var replayData: string
   withLock stateLock:
     if state.finished:
       return
     state.finished = true
-    failurePayload = state.failureJson()
+    failureDiagnostics = state.failureJson()
+    playerFailurePayload = state.playerFailureJson()
     var replayObj = state.sim.replayJson()
     replayObj.delete("results")
-    replayObj["failure"] = failurePayload
+    replayObj["failure"] = failureDiagnostics
     replayData = $replayObj
 
     let finalFrame = %*{
@@ -199,7 +223,7 @@ proc abortEpisode(runtimeConfig: RuntimeConfig) =
       "done": true,
       "failed": true,
       "reason": state.failure.kind,
-      "failure": failurePayload
+      "failure": failureDiagnostics
     }
     for slot, socket in state.playerSockets:
       var msg = copy(finalFrame)
@@ -212,12 +236,12 @@ proc abortEpisode(runtimeConfig: RuntimeConfig) =
 
   sleep(300)
   echo "grid-wars: aborting unfinished episode (",
-    failurePayload["failure_class"].getStr(), "/",
-    failurePayload["kind"].getStr(), "): ",
-    failurePayload["reason"].getStr()
+    failureDiagnostics["failure_class"].getStr(), "/",
+    failureDiagnostics["kind"].getStr(), "): ",
+    failureDiagnostics["reason"].getStr()
   let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
-  if failureUri.len > 0:
-    writeArtifact(failureUri, $failurePayload, "application/json",
+  if failureUri.len > 0 and not playerFailurePayload.isNil:
+    writeArtifact(failureUri, $playerFailurePayload, "application/json",
       "COGAME_PLAYER_FAILURE_METHOD")
   if runtimeConfig.replayUri.len > 0:
     writeArtifact(runtimeConfig.replayUri, replayData,
