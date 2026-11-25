@@ -128,29 +128,82 @@ suite "reply parsing":
     check submission.notes == "spiral"
     check submission.banner == "painting east"
 
-  test "a single string with newlines is accepted":
-    let reply = "{\"script\": \"var dx = 1\\nwhile true:\\n  place()\\n" &
-      "  move(dx, 0)\"}"
+  test "optional notes and banner default to empty strings":
+    let reply = """{"script": ["var dx = 1", "while true:", "  place()",
+      "  move(dx, 0)"]}"""
     let submission = parseSubmission(extractJsonObject(reply))
     check submission.script.len == 4
     check submission.notes == ""
     check submission.banner == ""
 
-  test "a markdown fence around the whole reply is stripped":
-    let reply = "```json\n{\"script\": [\"while true:\", \"  place()\"]}\n```"
-    let submission = parseSubmission(extractJsonObject(reply))
-    check submission.script == @["while true:", "  place()"]
+  test "a single string script is rejected":
+    let reply = "{\"script\": \"var dx = 1\\nwhile true:\\n  place()\\n" &
+      "  move(dx, 0)\"}"
+    expect GridWarsError:
+      discard parseSubmission(extractJsonObject(reply))
 
-  test "a fence inside the script value is stripped":
+  test "embedded newlines inside script lines are rejected":
+    let reply = "{\"script\": [\"while true:\\n  place()\"]}"
+    expect GridWarsError:
+      discard parseSubmission(extractJsonObject(reply))
+
+  test "a single outer json or plain markdown fence is accepted":
+    let tagged = "```json\n{\"script\": [\"while true:\", \"  place()\"]}\n```"
+    check parseSubmission(extractJsonObject(tagged)).script ==
+      @["while true:", "  place()"]
+    let plain = "```\n{\"script\": [\"while true:\", \"  place()\"]}\n```"
+    check parseSubmission(extractJsonObject(plain)).script ==
+      @["while true:", "  place()"]
+
+  test "unsupported fence tag or prose outside fence is rejected":
+    let wrongTag = "```python\n{\"script\": [\"while true:\", \"  place()\"]}\n```"
+    expect GridWarsError:
+      discard extractJsonObject(wrongTag)
+    let trailingFence =
+      "```json\n{\"script\": [\"while true:\", \"  place()\"]}\n```\nExtra prose."
+    expect GridWarsError:
+      discard extractJsonObject(trailingFence)
+    let leadingFence =
+      "Here is my warrior:\n```json\n{\"script\": [\"while true:\", \"  place()\"]}\n```"
+    expect GridWarsError:
+      discard extractJsonObject(leadingFence)
+
+  test "a fence inside the script value is rejected":
     let reply = """{"script": ["```nim", "while true:", "  place()", "```"]}"""
-    let submission = parseSubmission(extractJsonObject(reply))
-    check submission.script == @["while true:", "  place()"]
+    expect GwlCompileError:
+      discard parseSubmission(extractJsonObject(reply))
 
-  test "trailing prose after the closing brace is ignored":
-    let reply = "{\"script\": [\"while true:\", \"  place()\"]}\n\n" &
+  test "surrounding prose and extra JSON objects are rejected":
+    let trailing = "{\"script\": [\"while true:\", \"  place()\"]}\n\n" &
       "I hope this warrior serves you well."
-    let submission = parseSubmission(extractJsonObject(reply))
-    check submission.script.len == 2
+    expect GridWarsError:
+      discard extractJsonObject(trailing)
+    let leading = "Warrior:\n{\"script\": [\"while true:\", \"  place()\"]}"
+    expect GridWarsError:
+      discard extractJsonObject(leading)
+    let extraObject =
+      "{\"script\": [\"while true:\", \"  place()\"]}\n" &
+      "{\"script\": [\"while true:\", \"  wait()\"]}"
+    expect GridWarsError:
+      discard extractJsonObject(extraObject)
+    let twoFenced =
+      "```json\n{\"script\": [\"while true:\", \"  place()\"]}\n```\n" &
+      "```json\n{\"script\": [\"while true:\", \"  wait()\"]}\n```"
+    expect GridWarsError:
+      discard extractJsonObject(twoFenced)
+    expect GridWarsError:
+      discard extractJsonObject("""["while true:", "  place()"]""")
+
+  test "unknown fields and non-string optional fields are rejected":
+    expect GridWarsError:
+      discard parseSubmission(extractJsonObject(
+        """{"script": ["while true:", "  place()"], "extra": 1}"""))
+    expect GridWarsError:
+      discard parseSubmission(extractJsonObject(
+        """{"script": ["while true:", "  place()"], "notes": 123}"""))
+    expect GridWarsError:
+      discard parseSubmission(extractJsonObject(
+        """{"script": ["while true:", "  place()"], "banner": []}"""))
 
   test "a missing or empty script is a rejection":
     expect GridWarsError:
@@ -173,48 +226,53 @@ suite "reply parsing":
     let submission = parseSubmission(extractJsonObject(reply))
     check submission.script[1] == "  place()"
 
-  test "over-long lines, 120 lines and 4000 characters are capped":
-    var script = newJArray()
-    for index in 0 ..< 200:
-      script.add(%("var v" & $index & " = " & repeat("9", 200)))
-    let payload = %*{"script": script}
-    let capped = capScript(normaliseScript(payload["script"]))
-    check capped.len <= MaxScriptLines
-    var total = 0
-    for line in capped:
-      check line.runeLen <= MaxLineChars
-      total += line.runeLen + 1
-    check total <= MaxScriptChars
+  test "long valid lines compile and total program limits reject oversized scripts":
+    var tooManyLines = newJArray()
+    for index in 0 ..< MaxScriptLines + 1:
+      tooManyLines.add(%("var v" & $index & " = 1"))
+    expect GwlCompileError:
+      discard parseSubmission(%*{"script": tooManyLines})
 
-  test "notes and banner cap on RUNE boundaries, never bytes":
-    ## A byte cut through a multi-byte character produces replay bytes that
-    ## render in a browser and fail a strict JSON parser.
-    let long = repeat("é", 700)
-    let payload = %*{
+    let longLine = %*{"script": ["# " & repeat("a", 160), "while true:", "  place()"]}
+    discard parseSubmission(longLine)
+
+    var tooManyChars = newJArray()
+    for index in 0 ..< 60:
+      tooManyChars.add(%("# " & repeat("x", 80)))
+    tooManyChars.add(%"while true:")
+    tooManyChars.add(%"  place()")
+    expect GwlCompileError:
+      discard parseSubmission(%*{"script": tooManyChars})
+
+  test "long notes and banners preserve the original program":
+    let withinNotes = repeat("é", MaxNotesLen)
+    let withinBanner = repeat("ü", MaxBannerLen)
+    let ok = parseSubmission(%*{
       "script": ["while true:", "  place()"],
-      "notes": long,
-      "banner": repeat("ü", 200) & "\nsecond line"
-    }
-    let submission = parseSubmission(payload)
-    check submission.notes.runeLen == MaxNotesLen
-    check submission.notes.validateUtf8() == -1
-    check submission.banner.runeLen == MaxBannerLen
-    check submission.banner.validateUtf8() == -1
-    check "\n" notin submission.banner
+      "notes": withinNotes,
+      "banner": withinBanner
+    })
+    check ok.notes == withinNotes
+    check ok.notes.validateUtf8() == -1
+    check ok.banner == withinBanner
+    check ok.banner.validateUtf8() == -1
+
+    let longer = parseSubmission(%*{"script": ["while true:", "  place()"],
+      "notes": withinNotes & "é", "banner": withinBanner & "ü"})
+    check longer.notes.runeLen == MaxNotesLen
+    check longer.banner.runeLen == MaxBannerLen
+    check longer.script == ok.script
+    check recordedBanner("line one\nline two") == "line one line two"
 
   test "a reply with no JSON object at all quotes what arrived":
     try:
       discard extractJsonObject("I cannot help with that request.")
       check false
     except GridWarsError as error:
-      check "no JSON object" in error.msg
+      check "invalid JSON object" in error.msg
       check "I cannot help" in error.msg
 
   test "the quoted excerpt is cut on runes at every offset":
-    ## The excerpt travels into the retry prompt and, on a fallback, into
-    ## the replay's compileError. A byte cut at the 160-character mark
-    ## through the multi-byte character sitting on it would put a split
-    ## character in both.
     for pad in 150 .. 170:
       let refusal = "I am sorry, I cannot" & repeat("a", pad) & "é tail"
       try:
@@ -223,7 +281,6 @@ suite "reply parsing":
       except GridWarsError as error:
         check error.msg.validateUtf8() == -1
         check cleanText(error.msg, 300).validateUtf8() == -1
-        check fallbackSubmission(error.msg).rejected.validateUtf8() == -1
 
   test "a UTF-8 BOM does not defeat the parser":
     let reply = "\xEF\xBB\xBF{\"script\": [\"while true:\", \"  place()\"]}"

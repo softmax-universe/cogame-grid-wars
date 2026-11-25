@@ -23,7 +23,6 @@ const
   EnergyCap* = 60
   StepInstructions* = 2000
   MaxScriptLines* = 120
-  MaxLineChars* = 100
   MaxScriptChars* = 4000
   MaxNotesLen* = 600
   MaxBannerLen* = 80
@@ -857,23 +856,6 @@ proc playRound*(record: var RoundRecord, config: GameConfig) =
 
 # ---- Submission and the series ---------------------------------------------
 
-proc capScript*(lines: seq[string]): seq[string] =
-  ## Line-wise first, then rune boundaries: at most MaxScriptLines lines of
-  ## at most MaxLineChars runes, joined source at most MaxScriptChars runes.
-  var used = 0
-  for line in lines:
-    if result.len >= MaxScriptLines:
-      break
-    var text = line.replace("\t", "  ")
-    while text.len > 0 and text[^1] in {' ', '\r'}:
-      text.setLen(text.len - 1)
-    if text.runeLen > MaxLineChars:
-      text = text.runeSubStr(0, MaxLineChars)
-    if used + text.runeLen + 1 > MaxScriptChars:
-      break
-    used += text.runeLen + 1
-    result.add(text)
-
 proc settle(sim: var Sim, reason: string) =
   sim.done = true
   sim.reason = reason
@@ -919,11 +901,15 @@ proc runRound(sim: var Sim) =
     inc sim.round
     sim.openRound()
 
+proc recordedNotes*(notes: string): string =
+  cutRunes(notes.strip(), MaxNotesLen)
+
+proc recordedBanner*(banner: string): string =
+  cutRunes(banner.splitLines().join(" ").strip(), MaxBannerLen)
+
 proc submit*(sim: var Sim, seat: int, lines: seq[string],
-    notes, banner, origin: string, rejected = "") =
-  ## `seat` submits its warrior for the live round. The script is capped
-  ## and compiled here — the sim is the authority, not the caller — and the
-  ## fourth submission seals the round and runs the whole battle.
+    notes, banner, origin: string) =
+  ## Only compiled player programs participate in a battle.
   if sim.done:
     raise newException(GridWarsError, "the episode is over")
   if seat < 0 or seat >= Seats:
@@ -931,39 +917,28 @@ proc submit*(sim: var Sim, seat: int, lines: seq[string],
   if not sim.pending[seat]:
     raise newException(GridWarsError,
       sim.names[seat] & " has already submitted this round")
-  var script = capScript(lines)
-  var compileError = ""
+  if lines.len == 0:
+    raise newException(GridWarsError, "empty script")
   try:
-    discard compile(script)
+    discard compile(lines)
   except GwlCompileError as error:
-    ## Defensive: the LLM layer compiles before it submits and falls back
-    ## to `sentry` on failure, so this only fires for a caller that skipped
-    ## it. The warrior is left with no program, which halts it immediately.
-    compileError = cutRunes(error.msg, 300)
-    script = @[]
-  if script.len == 0 and compileError.len == 0:
-    compileError = "empty script"
-  if compileError.len == 0 and rejected.len > 0:
-    ## A fallback: the seat's own reply was rejected and `sentry` is
-    ## standing in. Record WHY, so the feed and the next prompt can say so.
-    compileError = cutRunes(rejected, 300)
-  sim.scripts[seat] = script
-  sim.origin[seat] = (if origin.len > 0: origin else: "llm")
-  sim.compileError[seat] = compileError
+    raise newException(GridWarsError, error.msg)
+  sim.scripts[seat] = lines
+  sim.origin[seat] = origin
+  sim.compileError[seat] = ""
   ## `banner` and `notes` are BOTH overwritten by every submission: a reply
   ## that carries neither leaves the seat with neither ("banner/notes
   ## missing => empty"). Keeping last round's notes because this round's
   ## reply omitted them would feed a seat text it did not write this round.
-  sim.banner[seat] = cutRunes(banner.replace("\n", " ").strip(), MaxBannerLen)
-  sim.notes[seat] = cutRunes(notes.strip(), MaxNotesLen)
+  sim.banner[seat] = recordedBanner(banner)
+  sim.notes[seat] = recordedNotes(notes)
   sim.pending[seat] = false
   var event = blankEvent(evSubmit)
   event.round = sim.round
   event.seat = seat
-  event.script = script
-  event.lines = script.len
+  event.script = lines
+  event.lines = lines.len
   event.origin = sim.origin[seat]
-  event.compileError = compileError
   event.banner = sim.banner[seat]
   event.scripted = sim.origin[seat] == "scripted"
   event.text = sim.notes[seat]
@@ -1368,7 +1343,7 @@ proc seatObservation*(sim: Sim, seat: int): string =
     let stat = last.stat[seat]
     result.add("YOUR LAST ROUND (round " & $sim.history.len & "):\n")
     if last.compileError[seat].len > 0:
-      result.add("  your script did NOT compile: " & last.compileError[seat] &
+      result.add("  your last submission was rejected: " & last.compileError[seat] &
         "\n")
     result.add("  ticks survived " & $stat.ticksLived & " of " &
       $last.ticksPlayed & "; " &

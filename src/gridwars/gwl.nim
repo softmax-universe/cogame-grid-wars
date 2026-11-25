@@ -19,7 +19,6 @@ const
   Grid* = 30
   Cells* = Grid * Grid
   MaxSourceLines* = 120
-  MaxSourceLineChars* = 100
   MaxSourceChars* = 4000
   MaxNodes* = 4000
   MaxProcs* = 32
@@ -191,9 +190,7 @@ proc isIdentChar(c: char): bool = c in {'a' .. 'z', 'A' .. 'Z', '0' .. '9', '_'}
 
 proc continuesLine(token: Token): bool =
   ## A line whose last token is a binary operator, a comma or an open
-  ## bracket runs on to the next one, exactly as Nim's does. Without this a
-  ## model that wraps a long condition (and the 100-character line cap
-  ## makes that likely) writes a program that cannot compile.
+  ## bracket runs on to the next one, exactly as Nim's does.
   case token.kind
   of tkOp:
     ## NOT "=": a `proc f() =` header ends the line, and an assignment with
@@ -212,6 +209,9 @@ proc lex(lines: seq[string]): seq[Token] =
   var continuing = false
   for index, rawLine in lines:
     let lineNo = index + 1
+    let invalidByte = rawLine.validateUtf8()
+    if invalidByte >= 0:
+      compileError(lineNo, "unexpected character " & rawLine.charAt(invalidByte))
     ## Tabs read as two spaces; `#` (and `##`) run to end of line.
     var text = rawLine.replace("\t", "  ")
     let hash = text.find('#')
@@ -1013,10 +1013,7 @@ proc compile*(lines: seq[string]): GwlProgram =
     compileError(lines.len, "a warrior is at most " & $MaxSourceLines &
       " lines, got " & $lines.len)
   var chars = 0
-  for index, line in lines:
-    if line.runeLen > MaxSourceLineChars:
-      compileError(index + 1, "a line is at most " & $MaxSourceLineChars &
-        " characters, got " & $line.runeLen)
+  for line in lines:
     chars += line.runeLen + 1
   if chars > MaxSourceChars:
     compileError(lines.len, "a warrior is at most " & $MaxSourceChars &
