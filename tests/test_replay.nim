@@ -75,31 +75,15 @@ suite "artifacts":
         total += line.getStr().runeLen + 1
       check total <= MaxScriptChars
 
-  test "captured error text reaches the replay on rune boundaries":
-    ## Lexer messages quoting a multi-byte character from the source land in
-    ## `submit.compileError` and are written out verbatim by `replayJson`.
+  test "an invalid program cannot enter the replay as an accepted submission":
     var sim = initSim(fixture(11, rounds = 1, ticks = 40))
-    for seat in sim.pendingSeats():
-      if seat == 0:
-        ## An em dash outside a comment: the lexer quotes the character.
-        sim.submit(seat, @["var a = 1", "var b = 2 \u2014 3"], "", "", "llm")
-      else:
-        let submission = scriptedSubmission(skSentry)
-        sim.submit(seat, submission.script, submission.notes, submission.banner,
-          submission.origin)
-    let raw = $sim.replayJson()
-    check raw.validateUtf8() == -1
-    var quotedDash = false
-    for event in parseJson(raw)["events"]:
-      if event["kind"].getStr() != "submit":
-        continue
-      if event["seat"].getInt() == 0:
-        let message = event["compileError"].getStr()
-        check message.len > 0
-        check message.runeLen <= 300
-        check message.validateUtf8() == -1
-        quotedDash = "\u2014" in message
-    check quotedDash
+    try:
+      sim.submit(0, @["var a = 1", "var b = 2 \u2014 3"], "", "", "llm")
+      check false
+    except GridWarsError as error:
+      check error.msg.validateUtf8() == -1
+    for event in sim.replayJson()["events"]:
+      check event["kind"].getStr() != "submit"
 
   test "results.reason is complete or deadline and nothing else":
     let complete = playScripted(fixture(3, rounds = 2, ticks = 80))

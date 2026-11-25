@@ -901,12 +901,15 @@ proc runRound(sim: var Sim) =
     inc sim.round
     sim.openRound()
 
+proc recordedNotes*(notes: string): string =
+  cutRunes(notes.strip(), MaxNotesLen)
+
+proc recordedBanner*(banner: string): string =
+  cutRunes(banner.splitLines().join(" ").strip(), MaxBannerLen)
+
 proc submit*(sim: var Sim, seat: int, lines: seq[string],
     notes, banner, origin: string) =
-  ## `seat` submits its warrior for the live round. The script, notes, and
-  ## banner are validated here without silent truncation — the sim is the
-  ## authority, not the caller — and the fourth submission seals the round
-  ## and runs the whole battle.
+  ## Only compiled player programs participate in a battle.
   if sim.done:
     raise newException(GridWarsError, "the episode is over")
   if seat < 0 or seat >= Seats:
@@ -914,43 +917,28 @@ proc submit*(sim: var Sim, seat: int, lines: seq[string],
   if not sim.pending[seat]:
     raise newException(GridWarsError,
       sim.names[seat] & " has already submitted this round")
-  let cleanNotes = notes.strip()
-  if cleanNotes.runeLen > MaxNotesLen:
-    raise newException(GridWarsError,
-      "notes exceeds maximum length of " & $MaxNotesLen & " characters")
-  if '\n' in banner or '\r' in banner:
-    raise newException(GridWarsError, "banner must be a single line")
-  let cleanBanner = banner.strip()
-  if cleanBanner.runeLen > MaxBannerLen:
-    raise newException(GridWarsError,
-      "banner exceeds maximum length of " & $MaxBannerLen & " characters")
-  var script = lines
-  var compileError = ""
-  if script.len == 0:
-    compileError = "empty script"
-  else:
-    try:
-      discard compile(script)
-    except GwlCompileError as error:
-      compileError = cutRunes(error.msg, 300)
-      script = @[]
-  sim.scripts[seat] = script
-  sim.origin[seat] = (if origin.len > 0: origin else: "llm")
-  sim.compileError[seat] = compileError
+  if lines.len == 0:
+    raise newException(GridWarsError, "empty script")
+  try:
+    discard compile(lines)
+  except GwlCompileError as error:
+    raise newException(GridWarsError, error.msg)
+  sim.scripts[seat] = lines
+  sim.origin[seat] = origin
+  sim.compileError[seat] = ""
   ## `banner` and `notes` are BOTH overwritten by every submission: a reply
   ## that carries neither leaves the seat with neither ("banner/notes
   ## missing => empty"). Keeping last round's notes because this round's
   ## reply omitted them would feed a seat text it did not write this round.
-  sim.banner[seat] = cleanBanner
-  sim.notes[seat] = cleanNotes
+  sim.banner[seat] = recordedBanner(banner)
+  sim.notes[seat] = recordedNotes(notes)
   sim.pending[seat] = false
   var event = blankEvent(evSubmit)
   event.round = sim.round
   event.seat = seat
-  event.script = script
-  event.lines = script.len
+  event.script = lines
+  event.lines = lines.len
   event.origin = sim.origin[seat]
-  event.compileError = compileError
   event.banner = sim.banner[seat]
   event.scripted = sim.origin[seat] == "scripted"
   event.text = sim.notes[seat]

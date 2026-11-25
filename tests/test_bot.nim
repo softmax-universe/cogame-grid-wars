@@ -244,7 +244,7 @@ suite "reply parsing":
     expect GwlCompileError:
       discard parseSubmission(%*{"script": tooManyChars})
 
-  test "over-long or multiline notes and banner are rejected without truncation":
+  test "long notes and banners preserve the original program":
     let withinNotes = repeat("é", MaxNotesLen)
     let withinBanner = repeat("ü", MaxBannerLen)
     let ok = parseSubmission(%*{
@@ -257,21 +257,12 @@ suite "reply parsing":
     check ok.banner == withinBanner
     check ok.banner.validateUtf8() == -1
 
-    expect GridWarsError:
-      discard parseSubmission(%*{
-        "script": ["while true:", "  place()"],
-        "notes": repeat("é", MaxNotesLen + 1)
-      })
-    expect GridWarsError:
-      discard parseSubmission(%*{
-        "script": ["while true:", "  place()"],
-        "banner": repeat("ü", MaxBannerLen + 1)
-      })
-    expect GridWarsError:
-      discard parseSubmission(%*{
-        "script": ["while true:", "  place()"],
-        "banner": "line one\nline two"
-      })
+    let longer = parseSubmission(%*{"script": ["while true:", "  place()"],
+      "notes": withinNotes & "é", "banner": withinBanner & "ü"})
+    check longer.notes.runeLen == MaxNotesLen
+    check longer.banner.runeLen == MaxBannerLen
+    check longer.script == ok.script
+    check recordedBanner("line one\nline two") == "line one line two"
 
   test "a reply with no JSON object at all quotes what arrived":
     try:

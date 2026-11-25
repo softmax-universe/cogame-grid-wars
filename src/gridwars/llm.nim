@@ -357,22 +357,11 @@ proc parseSubmission*(payload: JsonNode): Submission =
   if payload.hasKey("notes"):
     if payload["notes"].kind != JString:
       raise newException(GridWarsError, "notes must be a string")
-    let notes = payload["notes"].getStr().strip()
-    if notes.runeLen > MaxNotesLen:
-      raise newException(GridWarsError,
-        "notes exceeds maximum length of " & $MaxNotesLen & " characters")
-    result.notes = notes
+    result.notes = recordedNotes(payload["notes"].getStr())
   if payload.hasKey("banner"):
     if payload["banner"].kind != JString:
       raise newException(GridWarsError, "banner must be a string")
-    let rawBanner = payload["banner"].getStr()
-    if '\n' in rawBanner or '\r' in rawBanner:
-      raise newException(GridWarsError, "banner must be a single line")
-    let banner = rawBanner.strip()
-    if banner.runeLen > MaxBannerLen:
-      raise newException(GridWarsError,
-        "banner exceeds maximum length of " & $MaxBannerLen & " characters")
-    result.banner = banner
+    result.banner = recordedBanner(payload["banner"].getStr())
   result.script = normaliseScript(payload{"script"})
   result.origin = "llm"
   discard compile(result.script)

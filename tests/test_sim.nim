@@ -416,11 +416,9 @@ suite "endings and determinism":
     check sim.history[1].notes[0] == ""
     check sim.history[1].banner[0] == ""
 
-  test "a script that does not compile is recorded, not fatal":
-    var sim = initSim(fixture(seed = 1, rounds = 1, ticks = 60))
-    sim.submit(0, @["this is not GWL at all ###"], "", "", "llm")
-    for seat in sim.pendingSeats():
-      sim.submit(seat, lines(EastWalker), "", "", "scripted")
-    check sim.done
-    check sim.history[0].compileError[0].len > 0
-    check sim.history[0].stat[0].deathCause == "idle"
+  test "an uncompiled program cannot enter the battle or consume the seat":
+    var sim = initSim(fixture(11, rounds = 1, ticks = 40))
+    expect GridWarsError:
+      sim.submit(0, @["this is not GWL at all ###"], "", "", "llm")
+    check sim.pending[0]
+    check sim.history.len == 0
