@@ -70,9 +70,12 @@ def main() -> None:
     socket = websocket.create_connection(url, timeout=60)
     socket.settimeout(None)
     pending: dict[int, tuple[dict, dict | None, str]] = {}
+    local_error = False
     while True:
         opcode, data = socket.recv_data(control_frame=True)
         if opcode == websocket.ABNF.OPCODE_CLOSE:
+            if local_error:
+                raise SystemExit(1)
             raise RuntimeError("Grid Wars closed before the final frame")
         if opcode != websocket.ABNF.OPCODE_TEXT:
             continue
@@ -82,9 +85,18 @@ def main() -> None:
             try:
                 action, source = choose(frame, generator)
             except ValueError as exc:
-                pending[frame["round"]] = (frame, None, "forfeit")
+                local_error = True
+                pending[frame["round"]] = (frame, None, "error")
                 socket.send(
-                    json.dumps({"type": "forfeit", "round": frame["round"], "reason": str(exc)})
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "round": frame["round"],
+                            "category": "model_action",
+                            "kind": "invalid_action",
+                            "reason": str(exc),
+                        }
+                    )
                 )
             else:
                 pending[frame["round"]] = (frame, action, source)
@@ -93,11 +105,12 @@ def main() -> None:
                 )
         elif kind == "submission_result":
             turn, action, source = pending.pop(frame["round"])
-            if artifact and frame["accepted"] and action is not None:
+            executed_action = frame.get("action", action)
+            if artifact and frame["accepted"] and executed_action is not None:
                 artifact.record(
                     turn["system"],
                     turn["user"],
-                    action,
+                    executed_action,
                     source,
                     frame["round"],
                     {
@@ -107,12 +120,16 @@ def main() -> None:
                     },
                 )
         elif kind == "final":
+            if frame.get("failed"):
+                break
             if pending:
                 raise RuntimeError("Grid Wars ended with unacknowledged decisions")
             if artifact:
                 artifact.upload(frame["scores"])
             break
     socket.close()
+    if local_error:
+        raise SystemExit(1)
     print(f"Grid Wars ordinary player finished: slot={slot} backend={backend}", flush=True)
 
 

@@ -166,10 +166,30 @@ with open(os.path.join(work, "config.json"), "w") as fh:
 
 by_id = {p.get("id"): p for p in (manifest.get("player") or [])}
 extra_env = [kv for kv in (os.environ.get("SMOKE_EXTRA_ENV") or "").split() if "=" in kv]
+has_llm_creds = any(
+    os.environ.get(var)
+    for var in (
+        "ANTHROPIC_API_KEY",
+        "COWORLD_LLM_ENDPOINT",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+    )
+)
+scripted_ids = [
+    p.get("id")
+    for p in (manifest.get("player") or [])
+    if (p.get("env") or {}).get("PLAYER_SCRIPTED")
+]
+if not has_llm_creds:
+    print("offline scripted smoke (no LLM credentials): seating explicit scripted baselines")
 
 for slot in range(seats):
     player_id = cert_players[slot].get("player_id") if slot < len(cert_players) else None
     entry = by_id.get(player_id) or {}
+    if not has_llm_creds and (entry.get("env") or {}).get("COWORLD_LLM_ENABLED") == "true":
+        if scripted_ids:
+            player_id = scripted_ids[slot % len(scripted_ids)]
+            entry = by_id.get(player_id) or {}
     env_args = []
     for key, value in (entry.get("env") or {}).items():
         env_args += ["-e", f"{key}={value}"]
@@ -196,11 +216,15 @@ chmod 777 "${work_dir}"
 docker network create "${network}" >/dev/null
 
 player_model_env=()
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-  player_model_env+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
-  echo "ANTHROPIC_API_KEY present: prompt players can call Claude"
+for var in ANTHROPIC_API_KEY COWORLD_LLM_ENDPOINT COWORLD_LLM_MODEL AWS_BEARER_TOKEN_BEDROCK AWS_ENDPOINT_URL_BEDROCK_RUNTIME; do
+  if [ -n "${!var:-}" ]; then
+    player_model_env+=(-e "${var}=${!var}")
+  fi
+done
+if [ "${#player_model_env[@]}" -gt 0 ]; then
+  echo "LLM credentials/endpoint present: running certification fixture with model players"
 else
-  echo "no ANTHROPIC_API_KEY: prompt players use their local fallback"
+  echo "offline smoke: running explicit scripted baselines (no model credentials)"
 fi
 
 echo "starting game container (${image} ${game_bin}) ..."

@@ -226,34 +226,53 @@ suite "reply parsing":
     let submission = parseSubmission(extractJsonObject(reply))
     check submission.script[1] == "  place()"
 
-  test "over-long lines, 120 lines and 4000 characters are capped":
-    var script = newJArray()
-    for index in 0 ..< 200:
-      script.add(%("var v" & $index & " = " & repeat("9", 200)))
-    let payload = %*{"script": script}
-    let capped = capScript(normaliseScript(payload["script"]))
-    check capped.len <= MaxScriptLines
-    var total = 0
-    for line in capped:
-      check line.runeLen <= MaxLineChars
-      total += line.runeLen + 1
-    check total <= MaxScriptChars
+  test "over-long lines, 120 lines and 4000 characters are rejected without truncation":
+    var tooManyLines = newJArray()
+    for index in 0 ..< MaxScriptLines + 1:
+      tooManyLines.add(%("var v" & $index & " = 1"))
+    expect GwlCompileError:
+      discard parseSubmission(%*{"script": tooManyLines})
 
-  test "notes and banner cap on RUNE boundaries, never bytes":
-    ## A byte cut through a multi-byte character produces replay bytes that
-    ## render in a browser and fail a strict JSON parser.
-    let long = repeat("é", 700)
-    let payload = %*{
+    let tooLongLine = %*{"script": ["# " & repeat("a", MaxLineChars), "while true:", "  place()"]}
+    expect GwlCompileError:
+      discard parseSubmission(tooLongLine)
+
+    var tooManyChars = newJArray()
+    for index in 0 ..< 60:
+      tooManyChars.add(%("# " & repeat("x", 80)))
+    tooManyChars.add(%"while true:")
+    tooManyChars.add(%"  place()")
+    expect GwlCompileError:
+      discard parseSubmission(%*{"script": tooManyChars})
+
+  test "over-long or multiline notes and banner are rejected without truncation":
+    let withinNotes = repeat("é", MaxNotesLen)
+    let withinBanner = repeat("ü", MaxBannerLen)
+    let ok = parseSubmission(%*{
       "script": ["while true:", "  place()"],
-      "notes": long,
-      "banner": repeat("ü", 200) & "\nsecond line"
-    }
-    let submission = parseSubmission(payload)
-    check submission.notes.runeLen == MaxNotesLen
-    check submission.notes.validateUtf8() == -1
-    check submission.banner.runeLen == MaxBannerLen
-    check submission.banner.validateUtf8() == -1
-    check "\n" notin submission.banner
+      "notes": withinNotes,
+      "banner": withinBanner
+    })
+    check ok.notes == withinNotes
+    check ok.notes.validateUtf8() == -1
+    check ok.banner == withinBanner
+    check ok.banner.validateUtf8() == -1
+
+    expect GridWarsError:
+      discard parseSubmission(%*{
+        "script": ["while true:", "  place()"],
+        "notes": repeat("é", MaxNotesLen + 1)
+      })
+    expect GridWarsError:
+      discard parseSubmission(%*{
+        "script": ["while true:", "  place()"],
+        "banner": repeat("ü", MaxBannerLen + 1)
+      })
+    expect GridWarsError:
+      discard parseSubmission(%*{
+        "script": ["while true:", "  place()"],
+        "banner": "line one\nline two"
+      })
 
   test "a reply with no JSON object at all quotes what arrived":
     try:
@@ -264,10 +283,6 @@ suite "reply parsing":
       check "I cannot help" in error.msg
 
   test "the quoted excerpt is cut on runes at every offset":
-    ## The excerpt travels into the forfeit reason and into
-    ## the replay's compileError. A byte cut at the 160-character mark
-    ## through the multi-byte character sitting on it would put a split
-    ## character in both.
     for pad in 150 .. 170:
       let refusal = "I am sorry, I cannot" & repeat("a", pad) & "é tail"
       try:
@@ -276,10 +291,6 @@ suite "reply parsing":
       except GridWarsError as error:
         check error.msg.validateUtf8() == -1
         check cleanText(error.msg, 300).validateUtf8() == -1
-        let forfeit = forfeitSubmission(error.msg)
-        check forfeit.script.len == 0
-        check forfeit.origin == "forfeit"
-        check forfeit.rejected.validateUtf8() == -1
 
   test "a UTF-8 BOM does not defeat the parser":
     let reply = "\xEF\xBB\xBF{\"script\": [\"while true:\", \"  place()\"]}"

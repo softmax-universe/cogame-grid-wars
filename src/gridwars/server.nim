@@ -23,11 +23,11 @@
 ## Player protocol (gridwars.player.v3), all JSON text frames:
 ##   game -> player: {"type":"welcome","protocol":"gridwars.player.v3",...}
 ##                   {"type":"state",...} redacted to this seat
-##                   {"type":"final","scores":[...],...}
+##                   {"type":"final","scores":[...],...} (or {"type":"final","done":true,"failed":true,"failure":{...}} on abort)
 ##   game -> player: {"type":"turn","round":N,"observation":str,
 ##                   "timeout_ms":N}
 ##   player -> game: {"type":"submission","round":N,"action":{...}}
-##                   {"type":"forfeit","round":N,"reason":str}
+##                   {"type":"error","round":N,"category":"infrastructure|model_action","kind":str,"reason":str}
 
 import
   std/[json, locks, os, sets, strutils, tables, times],
@@ -50,6 +50,15 @@ const
     ## covers container start, player connects, and writing the artifacts.
 
 type
+  EpisodeFailure = object
+    active: bool
+    failureClass: string  ## "infrastructure" | "model_action"
+    kind: string
+    seat: int
+    round: int
+    reason: string
+    rejectedAction: JsonNode
+
   GameState = object
     selection: PromptSelection
     config: GameConfig
@@ -59,6 +68,7 @@ type
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
     globalSockets: HashSet[WebSocket]
+    failure: EpisodeFailure
     started: bool
     finished: bool
 
@@ -135,6 +145,85 @@ proc replayPayload(gs: GameState, results: JsonNode): string =
   payload["results"] = results
   $payload
 
+proc recordFailureLocked(gs: var GameState, failureClass, kind: string,
+    seat, round: int, reason: string, rejectedAction: JsonNode = nil) =
+  ## Callers hold stateLock. Records the first fatal failure that terminates
+  ## an unfinished episode unscored.
+  if gs.failure.active:
+    return
+  gs.failure = EpisodeFailure(
+    active: true,
+    failureClass: failureClass,
+    kind: kind,
+    seat: seat,
+    round: round,
+    reason: cleanText(reason, 400),
+    rejectedAction: rejectedAction
+  )
+
+proc failureJson(gs: GameState): JsonNode =
+  let playerName =
+    if gs.failure.seat >= 0 and gs.failure.seat < gs.config.players.len:
+      gs.config.players[gs.failure.seat].name
+    else: ""
+  result = %*{
+    "failed": true,
+    "failure_class": gs.failure.failureClass,
+    "kind": gs.failure.kind,
+    "seat": gs.failure.seat,
+    "player": playerName,
+    "round": gs.failure.round,
+    "rounds_played": gs.sim.roundsPlayed,
+    "reason": gs.failure.reason
+  }
+  if not gs.failure.rejectedAction.isNil:
+    result["rejected_action"] = gs.failure.rejectedAction
+
+proc abortEpisode(runtimeConfig: RuntimeConfig) =
+  ## Terminates an unfinished episode cleanly without authoritative gameplay
+  ## scores or winner, recording the failure cause to COGAME_PLAYER_FAILURE_URI.
+  var failurePayload: JsonNode
+  var replayData: string
+  withLock stateLock:
+    if state.finished:
+      return
+    state.finished = true
+    failurePayload = state.failureJson()
+    var replayObj = state.sim.replayJson()
+    replayObj.delete("results")
+    replayObj["failure"] = failurePayload
+    replayData = $replayObj
+
+    let finalFrame = %*{
+      "type": "final",
+      "done": true,
+      "failed": true,
+      "reason": state.failure.kind,
+      "failure": failurePayload
+    }
+    for slot, socket in state.playerSockets:
+      var msg = copy(finalFrame)
+      msg["slot"] = %slot
+      try:
+        socket.send($msg)
+      except CatchableError:
+        discard
+    state.broadcastLocked()
+
+  sleep(300)
+  echo "grid-wars: aborting unfinished episode (",
+    failurePayload["failure_class"].getStr(), "/",
+    failurePayload["kind"].getStr(), "): ",
+    failurePayload["reason"].getStr()
+  let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+  if failureUri.len > 0:
+    writeArtifact(failureUri, $failurePayload, "application/json",
+      "COGAME_PLAYER_FAILURE_METHOD")
+  if runtimeConfig.replayUri.len > 0:
+    writeArtifact(runtimeConfig.replayUri, replayData,
+      "application/octet-stream", "COGAME_SAVE_REPLAY_METHOD")
+  quit(1)
+
 proc finishEpisode(runtimeConfig: RuntimeConfig) =
   var results: JsonNode
   var replayData: string
@@ -195,11 +284,22 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         break
       sleep(200)
 
+    var missingSeat = -1
     withLock stateLock:
       state.started = true
       echo "grid-wars: starting with ", state.playerSockets.len, "/",
         config.tokens.len, " players connected"
+      if state.playerSockets.len < config.tokens.len:
+        for seat in 0 ..< config.tokens.len:
+          if not state.playerSockets.hasKey(seat):
+            missingSeat = seat
+            break
+        state.recordFailureLocked("infrastructure", "player_connect_timeout",
+          missingSeat, 0,
+          "seat " & $missingSeat & " failed to connect before timeout")
       state.broadcastLocked()
+    if missingSeat >= 0:
+      abortEpisode(runtimeConfig)
 
     let hostedTimeout = getEnv("COWORLD_TIMEOUT_SECONDS", "").strip()
     var timeoutSeconds =
@@ -219,21 +319,31 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
     while true:
       var seats: seq[int]
       var currentRound = 0
+      var shouldAbort = false
       withLock stateLock:
         if state.sim.done:
           break
         if playDeadline > 0.0 and
             epochTime() + RoundReserveSeconds > playDeadline:
-          echo "grid-wars: episode deadline reached after ",
-            state.sim.roundsPlayed, "/", config.rounds,
-            " rounds; ending early"
-          state.sim.endEarly()
-          state.broadcastLocked()
-          break
-        seats = state.sim.pendingSeats()
-        currentRound = state.sim.round
-        echo "grid-wars: round ", state.sim.round, " of ", config.rounds,
-          " at ", (epochTime() - gameStart).int, "s"
+          if state.sim.roundsPlayed == 0:
+            state.recordFailureLocked("infrastructure", "episode_timeout",
+              -1, state.sim.round,
+              "episode deadline reached before any round completed")
+            shouldAbort = true
+          else:
+            echo "grid-wars: episode deadline reached after ",
+              state.sim.roundsPlayed, "/", config.rounds,
+              " rounds; ending early"
+            state.sim.endEarly()
+            state.broadcastLocked()
+            break
+        if not shouldAbort:
+          seats = state.sim.pendingSeats()
+          currentRound = state.sim.round
+          echo "grid-wars: round ", state.sim.round, " of ", config.rounds,
+            " at ", (epochTime() - gameStart).int, "s"
+      if shouldAbort:
+        abortEpisode(runtimeConfig)
 
       let decisionDeadline = epochTime() +
         config.actionTimeoutSeconds.float
@@ -253,61 +363,100 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               "system": state.selection.ordinarySystemPrompt()
             })
             waitingSeats.add(seat)
+          else:
+            state.recordFailureLocked("infrastructure", "player_disconnected",
+              seat, currentRound,
+              "seat " & $seat & " disconnected before round " & $currentRound)
+            shouldAbort = true
+            break
+      if shouldAbort:
+        abortEpisode(runtimeConfig)
+
       while waitingSeats.len > 0 and epochTime() < decisionDeadline:
         var resolved = 0
+        var failedNow = false
         withLock stateLock:
-          for seat in waitingSeats:
-            if state.pendingSubmissions.hasKey(seat) or
-                not state.playerSockets.hasKey(seat):
-              resolved.inc
-        if resolved == waitingSeats.len:
+          if state.failure.active:
+            failedNow = true
+          else:
+            for seat in waitingSeats:
+              if state.pendingSubmissions.hasKey(seat):
+                resolved.inc
+              elif not state.playerSockets.hasKey(seat):
+                state.recordFailureLocked("infrastructure",
+                  "player_disconnected", seat, currentRound,
+                  "seat " & $seat & " disconnected during round " &
+                  $currentRound)
+                failedNow = true
+                break
+        if failedNow or resolved == waitingSeats.len:
           break
         sleep(20)
+
       var decisions = newSeq[Submission](seats.len)
       withLock stateLock:
-        for index, seat in seats:
-          if state.pendingSubmissions.hasKey(seat):
-            decisions[index] = state.pendingSubmissions[seat]
-          else:
-            let reason =
-              if state.playerSockets.hasKey(seat): "submission timed out"
-              else: "player disconnected"
-            echo "grid-wars: seat ", seat, " forfeited round ", currentRound,
-              " (", reason, ")"
-            decisions[index] = forfeitSubmission(reason)
+        if not state.failure.active:
+          for index, seat in seats:
+            if state.pendingSubmissions.hasKey(seat):
+              decisions[index] = state.pendingSubmissions[seat]
+            else:
+              let kind =
+                if state.playerSockets.hasKey(seat): "submission_timeout"
+                else: "player_disconnected"
+              let reason =
+                if state.playerSockets.hasKey(seat):
+                  "seat " & $seat & " submission timed out in round " &
+                  $currentRound
+                else:
+                  "seat " & $seat & " disconnected in round " & $currentRound
+              state.recordFailureLocked("infrastructure", kind, seat,
+                currentRound, reason)
+              break
         state.pendingRound = -1
+        if state.failure.active:
+          shouldAbort = true
+          if state.failure.seat >= 0 and
+              state.playerSockets.hasKey(state.failure.seat):
+            try:
+              state.playerSockets[state.failure.seat].send($ %*{
+                "type": "submission_result",
+                "round": currentRound,
+                "accepted": false,
+                "error": state.failure.reason
+              })
+            except CatchableError:
+              discard
+      if shouldAbort:
+        abortEpisode(runtimeConfig)
 
-      var accepted = newSeq[bool](seats.len)
       withLock stateLock:
         for index, seat in seats:
           let decision = decisions[index]
-          accepted[index] =
-            decision.origin != "forfeit" and decision.rejected.len == 0
           echo "grid-wars: round ", state.sim.round, " ",
             state.sim.names[seat], " submits ", decision.script.len,
             " lines (", decision.origin, ") at ",
             (epochTime() - gameStart).int, "s"
           try:
             state.sim.submit(seat, decision.script, decision.notes,
-              decision.banner, decision.origin, decision.rejected)
+              decision.banner, decision.origin)
           except GridWarsError as error:
-            echo "grid-wars: submission rejected (", error.msg,
-              "); forfeiting round"
-            let forfeit = forfeitSubmission(error.msg)
-            state.sim.submit(seat, forfeit.script, "", "", forfeit.origin,
-              forfeit.rejected)
-            decisions[index] = forfeit
-            accepted[index] = false
-        state.broadcastLocked()
-        for index, seat in seats:
-          if state.playerSockets.hasKey(seat):
-            var ack = %*{
-              "type": "submission_result", "round": currentRound,
-              "accepted": accepted[index]
-            }
-            if not accepted[index] and decisions[index].rejected.len > 0:
-              ack["error"] = %decisions[index].rejected
-            state.playerSockets[seat].send($ack)
+            state.recordFailureLocked("model_action", "invalid_action", seat,
+              currentRound, error.msg, submissionJson(decision))
+            shouldAbort = true
+            break
+        if not shouldAbort:
+          state.broadcastLocked()
+          for index, seat in seats:
+            if state.playerSockets.hasKey(seat):
+              let ack = %*{
+                "type": "submission_result",
+                "round": currentRound,
+                "accepted": true,
+                "action": submissionJson(decisions[index])
+              }
+              state.playerSockets[seat].send($ack)
+      if shouldAbort:
+        abortEpisode(runtimeConfig)
 
       if not state.sim.done and config.roundDelayMs > 0:
         sleep(config.roundDelayMs)
@@ -425,9 +574,10 @@ proc websocketHandler(
           let round = payload["round"].getInt()
           withLock stateLock:
             if round == state.pendingRound and
-                not state.pendingSubmissions.hasKey(slot):
+                not state.pendingSubmissions.hasKey(slot) and
+                not state.failure.active:
+              let action = payload{"action"}
               try:
-                let action = payload{"action"}
                 if action.isNil or action.kind != JObject:
                   raise newException(GridWarsError,
                     "submission action must be an object")
@@ -438,27 +588,35 @@ proc websocketHandler(
                 var submission = parseSubmission(action)
                 submission.origin = source
                 state.pendingSubmissions[slot] = submission
+              except GwlCompileError as error:
+                echo "grid-wars: seat ", slot, " submission compile error: ", error.msg
+                state.recordFailureLocked("model_action", "compile_error",
+                  slot, round, error.msg, action)
               except CatchableError as error:
                 echo "grid-wars: seat ", slot, " submission rejected: ", error.msg
-                state.pendingSubmissions[slot] = forfeitSubmission(error.msg)
-        of "forfeit":
-          let round = payload["round"].getInt()
-          let reason = payload{"reason"}.getStr("player forfeit")
+                state.recordFailureLocked("model_action", "invalid_action",
+                  slot, round, error.msg, action)
+        of "error":
+          let round = payload{"round"}.getInt(state.pendingRound)
+          let rawCategory = payload{"category"}.getStr("infrastructure")
+          let category =
+            if rawCategory in ["infrastructure", "model_action"]: rawCategory
+            else: "infrastructure"
+          let kind = payload{"kind"}.getStr("player_error")
+          let reason = payload{"reason"}.getStr("player reported error")
           withLock stateLock:
-            if round == state.pendingRound and
-                not state.pendingSubmissions.hasKey(slot):
-              echo "grid-wars: seat ", slot, " forfeited round ", round,
-                ": ", reason
-              state.pendingSubmissions[slot] = forfeitSubmission(reason)
+            if not state.failure.active:
+              echo "grid-wars: seat ", slot, " reported ", category, "/",
+                kind, " in round ", round, ": ", reason
+              state.recordFailureLocked(category, kind, slot, round, reason)
         else:
           discard
       except CatchableError as error:
         echo "grid-wars: bad player frame from seat ", slot, ": ", error.msg
         withLock stateLock:
-          if state.pendingRound >= 0 and
-              not state.pendingSubmissions.hasKey(slot):
-            state.pendingSubmissions[slot] = forfeitSubmission(
-              "malformed player frame: " & error.msg)
+          if state.pendingRound >= 0 and not state.failure.active:
+            state.recordFailureLocked("model_action", "protocol_error",
+              slot, state.pendingRound, "malformed player frame: " & error.msg)
     of ErrorEvent:
       discard
     of CloseEvent:

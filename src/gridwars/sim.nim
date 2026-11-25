@@ -857,23 +857,6 @@ proc playRound*(record: var RoundRecord, config: GameConfig) =
 
 # ---- Submission and the series ---------------------------------------------
 
-proc capScript*(lines: seq[string]): seq[string] =
-  ## Line-wise first, then rune boundaries: at most MaxScriptLines lines of
-  ## at most MaxLineChars runes, joined source at most MaxScriptChars runes.
-  var used = 0
-  for line in lines:
-    if result.len >= MaxScriptLines:
-      break
-    var text = line.replace("\t", "  ")
-    while text.len > 0 and text[^1] in {' ', '\r'}:
-      text.setLen(text.len - 1)
-    if text.runeLen > MaxLineChars:
-      text = text.runeSubStr(0, MaxLineChars)
-    if used + text.runeLen + 1 > MaxScriptChars:
-      break
-    used += text.runeLen + 1
-    result.add(text)
-
 proc settle(sim: var Sim, reason: string) =
   sim.done = true
   sim.reason = reason
@@ -920,10 +903,11 @@ proc runRound(sim: var Sim) =
     sim.openRound()
 
 proc submit*(sim: var Sim, seat: int, lines: seq[string],
-    notes, banner, origin: string, rejected = "") =
-  ## `seat` submits its warrior for the live round. The script is capped
-  ## and compiled here — the sim is the authority, not the caller — and the
-  ## fourth submission seals the round and runs the whole battle.
+    notes, banner, origin: string) =
+  ## `seat` submits its warrior for the live round. The script, notes, and
+  ## banner are validated here without silent truncation — the sim is the
+  ## authority, not the caller — and the fourth submission seals the round
+  ## and runs the whole battle.
   if sim.done:
     raise newException(GridWarsError, "the episode is over")
   if seat < 0 or seat >= Seats:
@@ -931,12 +915,19 @@ proc submit*(sim: var Sim, seat: int, lines: seq[string],
   if not sim.pending[seat]:
     raise newException(GridWarsError,
       sim.names[seat] & " has already submitted this round")
-  var script = capScript(lines)
+  let cleanNotes = notes.strip()
+  if cleanNotes.runeLen > MaxNotesLen:
+    raise newException(GridWarsError,
+      "notes exceeds maximum length of " & $MaxNotesLen & " characters")
+  if '\n' in banner or '\r' in banner:
+    raise newException(GridWarsError, "banner must be a single line")
+  let cleanBanner = banner.strip()
+  if cleanBanner.runeLen > MaxBannerLen:
+    raise newException(GridWarsError,
+      "banner exceeds maximum length of " & $MaxBannerLen & " characters")
+  var script = lines
   var compileError = ""
-  if rejected.len > 0:
-    compileError = cutRunes(rejected, 300)
-    script = @[]
-  elif script.len == 0:
+  if script.len == 0:
     compileError = "empty script"
   else:
     try:
@@ -951,8 +942,8 @@ proc submit*(sim: var Sim, seat: int, lines: seq[string],
   ## that carries neither leaves the seat with neither ("banner/notes
   ## missing => empty"). Keeping last round's notes because this round's
   ## reply omitted them would feed a seat text it did not write this round.
-  sim.banner[seat] = cutRunes(banner.replace("\n", " ").strip(), MaxBannerLen)
-  sim.notes[seat] = cutRunes(notes.strip(), MaxNotesLen)
+  sim.banner[seat] = cleanBanner
+  sim.notes[seat] = cleanNotes
   sim.pending[seat] = false
   var event = blankEvent(evSubmit)
   event.round = sim.round
@@ -1012,7 +1003,7 @@ proc resultsJson*(sim: Sim): JsonNode =
         inc seatDeaths
       if record.stat[seat].deathCause == "fault":
         inc seatFaults
-      if record.origin[seat] in ["fallback", "forfeit"]:
+      if record.origin[seat] == "fallback":
         inc seatFallbacks
     kills.add(%seatKills)
     deaths.add(%seatDeaths)

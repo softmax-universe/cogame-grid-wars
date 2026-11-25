@@ -38,8 +38,8 @@ proc playNoisy(config: GameConfig): Sim =
   while not result.done:
     for seat in result.pendingSeats():
       var script = warriorLines(skSentry)
-      script.insert("# " & noisy(20), 0)
-      result.submit(seat, script, noisy(60), noisy(20), "llm")
+      script.insert("# " & noisy(3), 0)
+      result.submit(seat, script, noisy(10), noisy(2), "llm")
 
 suite "artifacts":
   test "a whole episode writes a replay that a STRICT parser accepts":
@@ -77,9 +77,7 @@ suite "artifacts":
       check total <= MaxScriptChars
 
   test "captured error text reaches the replay on rune boundaries":
-    ## The other road into the replay: not a seat's own prose but text the
-    ## game CAPTURED — a lexer message quoting a character from the source,
-    ## and a rejection excerpt from a model reply. Both land in
+    ## Lexer messages quoting a multi-byte character from the source land in
     ## `submit.compileError` and are written out verbatim by `replayJson`.
     var sim = initSim(fixture(11, rounds = 1, ticks = 40))
     for seat in sim.pendingSeats():
@@ -87,29 +85,21 @@ suite "artifacts":
         ## An em dash outside a comment: the lexer quotes the character.
         sim.submit(seat, @["var a = 1", "var b = 2 \u2014 3"], "", "", "llm")
       else:
-        ## A forfeit carrying a long multi-byte rejection, cut at the cap.
-        let forfeit = forfeitSubmission(
-          "invalid JSON object in response: " & noisy(40))
-        sim.submit(seat, forfeit.script, forfeit.notes, forfeit.banner,
-          forfeit.origin, forfeit.rejected)
+        let submission = scriptedSubmission(skSentry)
+        sim.submit(seat, submission.script, submission.notes, submission.banner,
+          submission.origin)
     let raw = $sim.replayJson()
     check raw.validateUtf8() == -1
-    var captured = 0
     var quotedDash = false
     for event in parseJson(raw)["events"]:
       if event["kind"].getStr() != "submit":
         continue
-      let message = event["compileError"].getStr()
-      check message.len > 0
-      check message.runeLen <= 300
-      check message.validateUtf8() == -1
       if event["seat"].getInt() == 0:
+        let message = event["compileError"].getStr()
+        check message.len > 0
+        check message.runeLen <= 300
+        check message.validateUtf8() == -1
         quotedDash = "\u2014" in message
-      else:
-        check event["origin"].getStr() == "forfeit"
-        check event["script"].len == 0
-      inc captured
-    check captured == Seats
     check quotedDash
 
   test "results.reason is complete or deadline and nothing else":

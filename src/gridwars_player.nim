@@ -13,7 +13,7 @@
 import
   std/[json, options, os, strutils],
   whisky,
-  gridwars/[llm, prompts]
+  gridwars/[gwl, llm, prompts]
 
 const DefaultPrompt = """
 Write a warrior that claims ground and stays alive. Paint every cell you
@@ -42,6 +42,7 @@ when isMainModule:
       getEnv("PLAYER_MODEL", "claude-sonnet-5"))
     else: nil
   var slot = -1
+  var exitCode = 0
 
   echo "grid-wars player: connecting to game"
   let socket = newWebSocket(url)
@@ -79,11 +80,14 @@ when isMainModule:
               "source": "scripted",
               "action": submissionJson(submission)})
           elif client.disabled:
-            echo "grid-wars player: forfeiting round ", round,
+            echo "grid-wars player: failing round ", round,
               " (no player model credential)"
-            socket.send($ %*{"type": "forfeit",
+            socket.send($ %*{"type": "error",
               "round": round,
+              "category": "infrastructure",
+              "kind": "missing_credentials",
               "reason": "no player model credential"})
+            exitCode = 1
           else:
             try:
               let submission = choosePromptSubmission(client,
@@ -94,22 +98,44 @@ when isMainModule:
                 "round": round,
                 "source": "player",
                 "action": submissionJson(submission)})
+            except LlmInfraError as error:
+              echo "grid-wars player: provider/infrastructure error: ", error.msg
+              socket.send($ %*{"type": "error",
+                "round": round,
+                "category": "infrastructure",
+                "kind": "provider_error",
+                "reason": cleanText(error.msg, 300)})
+              exitCode = 1
+            except GwlCompileError as error:
+              echo "grid-wars player: model script compile error: ", error.msg
+              socket.send($ %*{"type": "error",
+                "round": round,
+                "category": "model_action",
+                "kind": "compile_error",
+                "reason": cleanText(error.msg, 300)})
+              exitCode = 1
             except CatchableError as error:
               echo "grid-wars player: model reply rejected: ", error.msg
-              socket.send($ %*{"type": "forfeit",
+              socket.send($ %*{"type": "error",
                 "round": round,
+                "category": "model_action",
+                "kind": "invalid_action",
                 "reason": cleanText(error.msg, 300)})
+              exitCode = 1
         of "final":
-          echo "grid-wars player: final scores ", payload{"scores"}
+          if payload{"failed"}.getBool(false):
+            echo "grid-wars player: episode aborted: ", payload{"reason"}.getStr()
+          else:
+            echo "grid-wars player: final scores ", payload{"scores"}
           break
         else:
           discard
       except CatchableError as error:
         echo "grid-wars player: ignoring bad frame: ", error.msg
   except CatchableError as error:
-    echo "grid-wars player: socket closed (", error.msg, "), exiting 0"
+    echo "grid-wars player: socket closed (", error.msg, "), exiting ", exitCode
   try:
     socket.close()
   except CatchableError:
     discard
-  quit(0)
+  quit(exitCode)

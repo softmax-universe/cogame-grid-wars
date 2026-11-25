@@ -6,7 +6,8 @@
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no player credential the bundled prompt policy forfeits the round.
+## With no player credential the bundled prompt policy fails the turn with an
+## infrastructure error instead of substituting a fallback warrior.
 
 import
   std/[json, os, strutils, unicode],
@@ -31,12 +32,15 @@ type
     skBomber = "bomber"
     skSentry = "sentry"
 
+  LlmInfraError* = object of GridWarsError
+    ## Raised when credentials, transport, or the upstream provider fail
+    ## (as opposed to a model-generated invalid or uncompilable action).
+
   Submission* = object
     script*: seq[string]
     notes*: string      ## "" when the reply carried none
     banner*: string
-    origin*: string     ## "llm" | "player" | "scripted" | "forfeit"
-    rejected*: string   ## forfeit only: why the seat's reply was refused or missing
+    origin*: string     ## "llm" | "player" | "scripted"
 
   LlmTransport = enum
     ltNone, ltSidecar, ltBedrock, ltAnthropic
@@ -47,8 +51,7 @@ type
     apiKey: string
     sidecarEndpoint: string
     bedrockEndpoint: string
-    bedrockModels: seq[string]
-    bedrockModel: int
+    bedrockModel: string
     bedrockToken: string
     model: string
     maxOutputTokens: int
@@ -85,33 +88,14 @@ proc resolveApiKey(): string =
     echo "grid-wars llm: failed to fetch ANTHROPIC_API_KEY_URI: ", error.msg
     result = ""
 
-proc bedrockModelIds(): seq[string] =
-  ## Haiku leads: hosted Bedrock capacity is shared account-wide and the
-  ## sonnet profiles run out of daily tokens first.
-  ## `us.anthropic.claude-sonnet-4-6` is deliberately NOT a candidate — it
-  ## times out on every sidecar call, and one throttle then cascades into
-  ## scripted fallbacks for the rest of the episode.
+proc bedrockModelId(): string =
   let pinned = getEnv("BEDROCK_MODEL").strip()
   if pinned.len > 0:
-    return @[pinned]
-  @[
-    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-  ]
-
-proc tryNextBedrockModel(client: LlmClient, why: string): bool =
-  if client.transport != ltBedrock or
-      client.bedrockModel + 1 >= client.bedrockModels.len:
-    return false
-  client.bedrockModel.inc
-  echo "grid-wars llm: ", client.bedrockModels[client.bedrockModel - 1],
-    " unusable (", why, "); falling back to ",
-    client.bedrockModels[client.bedrockModel]
-  true
+    return pinned
+  "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 proc bedrockUrl(client: LlmClient): string =
-  client.bedrockEndpoint & "/model/" &
-    client.bedrockModels[client.bedrockModel] & "/invoke"
+  client.bedrockEndpoint & "/model/" & client.bedrockModel & "/invoke"
 
 proc newLlmClient*(maxOutputTokens: int, model: string): LlmClient =
   result = LlmClient(model: model, maxOutputTokens: maxOutputTokens)
@@ -131,11 +115,11 @@ proc newLlmClient*(maxOutputTokens: int, model: string): LlmClient =
       else: "https://bedrock-runtime." & region & ".amazonaws.com"
     result.transport = ltBedrock
     result.bedrockEndpoint = endpoint.strip(chars = {'/'}, leading = false)
-    result.bedrockModels = bedrockModelIds()
+    result.bedrockModel = bedrockModelId()
     result.bedrockToken = bedrockToken
     result.curl = newCurly()
     echo "grid-wars llm: bedrock transport, model ",
-      result.bedrockModels[result.bedrockModel], ", url ", result.bedrockUrl
+      result.bedrockModel, ", url ", result.bedrockUrl
     return
   result.apiKey = resolveApiKey()
   if result.apiKey.len > 0:
@@ -145,7 +129,7 @@ proc newLlmClient*(maxOutputTokens: int, model: string): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "grid-wars llm: no LLM credentials; prompt turns will forfeit"
+    echo "grid-wars llm: no LLM credentials; prompt turns will fail"
 
 # ---- Scripted baselines -----------------------------------------------------
 
@@ -168,10 +152,6 @@ proc submissionJson*(submission: Submission): JsonNode =
   ## Complete normal player action, including the source lines.
   %*{"script": submission.script, "notes": submission.notes,
     "banner": submission.banner}
-
-proc forfeitSubmission*(reason: string): Submission =
-  Submission(script: @[], origin: "forfeit",
-    rejected: cleanText(reason, 300))
 
 # ---- Prompts ----------------------------------------------------------------
 
@@ -378,13 +358,23 @@ proc parseSubmission*(payload: JsonNode): Submission =
   if payload.hasKey("notes"):
     if payload["notes"].kind != JString:
       raise newException(GridWarsError, "notes must be a string")
-    result.notes = cleanText(payload["notes"].getStr(), MaxNotesLen)
+    let notes = payload["notes"].getStr().strip()
+    if notes.runeLen > MaxNotesLen:
+      raise newException(GridWarsError,
+        "notes exceeds maximum length of " & $MaxNotesLen & " characters")
+    result.notes = notes
   if payload.hasKey("banner"):
     if payload["banner"].kind != JString:
       raise newException(GridWarsError, "banner must be a string")
-    result.banner = cleanText(payload["banner"].getStr().replace("\n", " "),
-      MaxBannerLen)
-  result.script = capScript(normaliseScript(payload{"script"}))
+    let rawBanner = payload["banner"].getStr()
+    if '\n' in rawBanner or '\r' in rawBanner:
+      raise newException(GridWarsError, "banner must be a single line")
+    let banner = rawBanner.strip()
+    if banner.runeLen > MaxBannerLen:
+      raise newException(GridWarsError,
+        "banner exceeds maximum length of " & $MaxBannerLen & " characters")
+    result.banner = banner
+  result.script = normaliseScript(payload{"script"})
   result.origin = "llm"
   discard compile(result.script)
 
@@ -424,25 +414,28 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
 
 proc textOf(client: LlmClient, response: Response, error, url: string): string =
   if error.len > 0:
-    raise newException(GridWarsError, "llm transport: " & error)
+    raise newException(LlmInfraError, "llm transport: " & error)
   if response.code == 401 or response.code == 403:
     let detail = cutRunes(response.body, 400)
-    if "Model access is denied" in response.body and
-        client.tryNextBedrockModel("no model access"):
-      raise newException(GridWarsError, "bedrock model access denied: " & detail)
     client.disabled = true
-    raise newException(GridWarsError,
+    raise newException(LlmInfraError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     let detail = cutRunes(response.body, 300)
-    discard client.tryNextBedrockModel("throttled")
-    raise newException(GridWarsError, "llm throttled (429): " & detail)
+    raise newException(LlmInfraError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
-    raise newException(GridWarsError, "anthropic error " & $response.code &
+    raise newException(LlmInfraError, "provider error " & $response.code &
       ": " & cutRunes(response.body, 300))
-  let payload = parseJson(response.body)
+  var payload: JsonNode
+  try:
+    payload = parseJson(response.body)
+  except CatchableError as err:
+    raise newException(LlmInfraError,
+      "provider returned invalid JSON: " & err.msg)
   if payload{"stop_reason"}.getStr() == "refusal":
-    raise newException(GridWarsError, "anthropic refusal")
+    raise newException(GridWarsError, "model refusal")
+  if not payload.hasKey("content") or payload["content"].kind != JArray:
+    raise newException(LlmInfraError, "provider response missing content array")
   for contentBlock in payload["content"]:
     if contentBlock{"type"}.getStr() == "text":
       result.add(contentBlock{"text"}.getStr())
@@ -473,6 +466,10 @@ proc choosePromptSubmission*(client: LlmClient, observation, prompt: string,
   var request = client.requestFor(system, user, -1)
   if client.transport == ltSidecar:
     request.headers["x-coworld-player-slot"] = $slot
-  let response = client.curl.post(request.url, request.headers, request.body,
-    timeoutSeconds)
+  var response: Response
+  try:
+    response = client.curl.post(request.url, request.headers, request.body,
+      timeoutSeconds)
+  except CatchableError as err:
+    raise newException(LlmInfraError, "llm transport: " & err.msg)
   parseSubmission(extractJsonObject(client.textOf(response, "", request.url)))
