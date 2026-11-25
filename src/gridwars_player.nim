@@ -71,26 +71,34 @@ when isMainModule:
             slot, " as ", payload{"name"}.getStr(),
             " (warrior ", payload{"id"}.getInt(), ")"
         of "turn":
-          var submission: Submission
+          let round = payload["round"].getInt()
           if scriptKind != skNone:
-            submission = scriptedSubmission(scriptKind)
+            let submission = scriptedSubmission(scriptKind)
+            socket.send($ %*{"type": "submission",
+              "round": round,
+              "source": "scripted",
+              "action": submissionJson(submission)})
           elif client.disabled:
-            submission = fallbackSubmission("no player model credential")
+            echo "grid-wars player: forfeiting round ", round,
+              " (no player model credential)"
+            socket.send($ %*{"type": "forfeit",
+              "round": round,
+              "reason": "no player model credential"})
           else:
             try:
-              submission = choosePromptSubmission(client,
+              let submission = choosePromptSubmission(client,
                 payload["observation"].getStr(), prompt,
                 max(1, payload["timeout_ms"].getInt() div 1000 - 1), slot,
                 promptSelection(payload["prompt_config"]))
+              socket.send($ %*{"type": "submission",
+                "round": round,
+                "source": "player",
+                "action": submissionJson(submission)})
             except CatchableError as error:
-              echo "grid-wars player: model call failed: ", error.msg
-              submission = fallbackSubmission(error.msg)
-          socket.send($ %*{"type": "submission",
-            "round": payload["round"].getInt(),
-            "source": (if submission.origin == "fallback": "fallback"
-                       elif submission.origin == "scripted": "scripted"
-                       else: "player"),
-            "action": submissionJson(submission)})
+              echo "grid-wars player: model reply rejected: ", error.msg
+              socket.send($ %*{"type": "forfeit",
+                "round": round,
+                "reason": cleanText(error.msg, 300)})
         of "final":
           echo "grid-wars player: final scores ", payload{"scores"}
           break

@@ -14,9 +14,43 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 GAME, PLAYER = sys.argv[1:3]
+import importlib.util
+
 ROOT = Path(__file__).resolve().parents[2]
 PAINTER = (ROOT / "data/warriors/painter.gwl").read_text().splitlines()
 requests = {"prompt": 0}
+
+
+def check_ordinary_parser():
+    spec = importlib.util.spec_from_file_location("ordinary_player", ROOT / "players/ordinary/player.py")
+    assert spec and spec.loader
+    sys.path.insert(0, str(ROOT / "players/ordinary"))
+    try:
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    finally:
+        sys.path.pop(0)
+    payload = {"script": ["while true:", "  place()"], "notes": "", "banner": ""}
+    encoded = json.dumps(payload)
+    assert mod.parse_json_object(encoded) == payload
+    assert mod.parse_json_object(f"```json\n{encoded}\n```") == payload
+    assert mod.parse_json_object(f"```\n{encoded}\n```") == payload
+    for bad in (
+        f"Here you go:\n{encoded}",
+        f"{encoded}\nHope this helps!",
+        f"{encoded}\n{encoded}",
+        f"```json\n{encoded}\n```\nExtra prose",
+        f"```python\n{encoded}\n```",
+        "[]",
+    ):
+        try:
+            mod.parse_json_object(bad)
+            raise AssertionError(f"should have rejected: {bad!r}")
+        except ValueError:
+            pass
+
+
+check_ordinary_parser()
 
 
 class Stub(BaseHTTPRequestHandler):
@@ -28,10 +62,15 @@ class Stub(BaseHTTPRequestHandler):
         assert "Maximize your mean roundScore across the rounds played." in body["system"]
         assert "50 per self-kill" in body["system"]
         requests["prompt"] += 1
-        assert self.headers["X-Coworld-Player-Slot"] == "1"
-        response = {"content": [{"type": "text", "text": json.dumps(
-            {"script": PAINTER, "notes": "stub", "banner": "painting"})}],
-            "stop_reason": "end_turn"}
+        slot = self.headers["X-Coworld-Player-Slot"]
+        if slot == "1":
+            # Round 1 bare JSON, round 2 wrapped in a single outer ```json fence.
+            raw = json.dumps({"script": PAINTER, "notes": "stub", "banner": "painting"})
+            text = raw if requests["prompt"] == 1 else f"```json\n{raw}\n```"
+        else:
+            # Slot 3 returns surrounding prose, which must be rejected and forfeited (no sentry substitution).
+            text = json.dumps({"script": PAINTER}) + "\nGood luck!"
+        response = {"content": [{"type": "text", "text": text}], "stop_reason": "end_turn"}
         encoded = json.dumps(response).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -112,7 +151,67 @@ with tempfile.TemporaryDirectory(prefix="gridwars-policy-") as scratch:
         for decision in trajectory["decisions"]:
             assert decision["prompt_template"]["variant"] == "reordered"
             assert "Maximize your mean roundScore across the rounds played." in decision["prompt"][0]["content"]
-        print("Grid Wars player smoke: 2 canned, 2 prompt, 4 scripted programs, zero fallback")
+        print("Grid Wars player smoke: 2 canned, 2 prompt (bare + fenced), 4 scripted programs, zero fallback")
+        # Second episode: verify rejected prompt reply and missing-credential prompt player forfeit with empty script.
+        scratch2 = root / "forfeit"
+        scratch2.mkdir()
+        (scratch2 / "config.json").write_text(json.dumps(config))
+        port2 = free_port()
+        game2_env = os.environ.copy()
+        game2_env.update({"COGAME_HOST": "127.0.0.1", "COGAME_PORT": str(port2),
+                          "COGAME_CONFIG_URI": (scratch2 / "config.json").as_uri(),
+                          "COGAME_RESULTS_URI": (scratch2 / "results.json").as_uri(),
+                          "COGAME_SAVE_REPLAY_URI": (scratch2 / "replay.json").as_uri()})
+        game2 = subprocess.Popen([GAME], env=game2_env,
+                                 stdout=(scratch2 / "game.log").open("w"), stderr=subprocess.STDOUT)
+        players2 = []
+        try:
+            for _ in range(100):
+                if game2.poll() is not None:
+                    raise AssertionError((scratch2 / "game.log").read_text())
+                with socket.socket() as probe:
+                    if probe.connect_ex(("127.0.0.1", port2)) == 0:
+                        break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("game2 socket unavailable")
+            for slot, settings, with_endpoint in (
+                (0, {"PLAYER_SCRIPTED": "painter"}, False),
+                (1, {"PLAYER_SCRIPTED": "bomber"}, False),
+                (2, {"PLAYER_PROMPT": "No credentials."}, False),
+                (3, {"PLAYER_PROMPT": "Trailing prose reply."}, True),
+            ):
+                env = {k: v for k, v in os.environ.items()
+                       if k not in ("COWORLD_LLM_ENDPOINT", "ANTHROPIC_API_KEY",
+                                    "ANTHROPIC_API_KEY_URI", "AWS_BEARER_TOKEN_BEDROCK",
+                                    "AWS_ENDPOINT_URL_BEDROCK_RUNTIME")}
+                env.update(settings)
+                env["COWORLD_PLAYER_WS_URL"] = f"ws://127.0.0.1:{port2}/player?slot={slot}&token=token-{slot}"
+                if with_endpoint:
+                    env["COWORLD_LLM_ENDPOINT"] = f"http://127.0.0.1:{model.server_port}"
+                players2.append(subprocess.Popen([PLAYER], env=env, cwd=ROOT,
+                                stdout=(scratch2 / f"player-{slot}.log").open("w"),
+                                stderr=subprocess.STDOUT))
+            assert game2.wait(timeout=65) == 0, (scratch2 / "game.log").read_text()
+            for slot, player in enumerate(players2):
+                assert player.wait(timeout=5) == 0, (scratch2 / f"player-{slot}.log").read_text()
+            results2 = json.loads((scratch2 / "results.json").read_text())
+            replay2 = json.loads((scratch2 / "replay.json").read_text())
+            assert results2["reason"] == "complete", results2
+            assert results2["fallbacks"] == [0, 0, 2, 2], results2
+            subs2 = [event for event in replay2["events"] if event["kind"] == "submit"]
+            assert [event["origin"] for event in subs2] == [
+                "scripted", "scripted", "forfeit", "forfeit"] * 2, subs2
+            for event in subs2:
+                if event["seat"] in (2, 3):
+                    assert event["script"] == [], event
+                    assert event["compileError"], event
+            print("Grid Wars forfeit smoke: rejected prose and missing credentials forfeit with empty script")
+        finally:
+            for process in [*players2, game2]:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=5)
     finally:
         for process in [*players, game]:
             if process.poll() is None:

@@ -138,15 +138,20 @@ suite "the seat observation":
         "must begin with the character {"]:
       check needle in text
 
-  test "extractJsonObject stops at the first balanced object despite trailing braces or string braces":
-    let trailingBraces =
+  test "extractJsonObject parses a single object with braces in strings and rejects trailing text":
+    let clean =
       "{\"script\": [\"# close } and quote \\\"}\\\"\", \"while true:\", \"  place()\"], " &
-      "\"notes\": \"avoid {traps} and }\", \"banner\": \"go {east}\"}\n" &
-      "Trailing commentary mentioning {extra: 1} and a stray }."
-    let parsed = parseSubmission(extractJsonObject(trailingBraces))
+      "\"notes\": \"avoid {traps} and }\", \"banner\": \"go {east}\"}"
+    let parsed = parseSubmission(extractJsonObject(clean))
     check parsed.script.len == 3
     check parsed.notes == "avoid {traps} and }"
     check parsed.banner == "go {east}"
+    let fenced = "```json\n" & clean & "\n```"
+    check parseSubmission(extractJsonObject(fenced)).script == parsed.script
+    let trailingBraces =
+      clean & "\nTrailing commentary mentioning {extra: 1} and a stray }."
+    expect GridWarsError:
+      discard extractJsonObject(trailingBraces)
     expect GridWarsError:
       discard extractJsonObject("{\"script\": [\"while true:\"")
 

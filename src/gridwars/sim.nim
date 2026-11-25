@@ -933,20 +933,17 @@ proc submit*(sim: var Sim, seat: int, lines: seq[string],
       sim.names[seat] & " has already submitted this round")
   var script = capScript(lines)
   var compileError = ""
-  try:
-    discard compile(script)
-  except GwlCompileError as error:
-    ## Defensive: the LLM layer compiles before it submits and falls back
-    ## to `sentry` on failure, so this only fires for a caller that skipped
-    ## it. The warrior is left with no program, which halts it immediately.
-    compileError = cutRunes(error.msg, 300)
-    script = @[]
-  if script.len == 0 and compileError.len == 0:
-    compileError = "empty script"
-  if compileError.len == 0 and rejected.len > 0:
-    ## A fallback: the seat's own reply was rejected and `sentry` is
-    ## standing in. Record WHY, so the feed and the next prompt can say so.
+  if rejected.len > 0:
     compileError = cutRunes(rejected, 300)
+    script = @[]
+  elif script.len == 0:
+    compileError = "empty script"
+  else:
+    try:
+      discard compile(script)
+    except GwlCompileError as error:
+      compileError = cutRunes(error.msg, 300)
+      script = @[]
   sim.scripts[seat] = script
   sim.origin[seat] = (if origin.len > 0: origin else: "llm")
   sim.compileError[seat] = compileError
@@ -1015,7 +1012,7 @@ proc resultsJson*(sim: Sim): JsonNode =
         inc seatDeaths
       if record.stat[seat].deathCause == "fault":
         inc seatFaults
-      if record.origin[seat] == "fallback":
+      if record.origin[seat] in ["fallback", "forfeit"]:
         inc seatFallbacks
     kills.add(%seatKills)
     deaths.add(%seatDeaths)
@@ -1368,7 +1365,7 @@ proc seatObservation*(sim: Sim, seat: int): string =
     let stat = last.stat[seat]
     result.add("YOUR LAST ROUND (round " & $sim.history.len & "):\n")
     if last.compileError[seat].len > 0:
-      result.add("  your script did NOT compile: " & last.compileError[seat] &
+      result.add("  your last submission was rejected: " & last.compileError[seat] &
         "\n")
     result.add("  ticks survived " & $stat.ticksLived & " of " &
       $last.ticksPlayed & "; " &

@@ -531,7 +531,8 @@ body.feed-collapsed #feed { display: none; }
 }
 #codehead .chip.llm { background: var(--green); }
 #codehead .chip.retry { background: var(--amber); }
-#codehead .chip.fallback { background: var(--red); color: var(--paper); }
+#codehead .chip.fallback,
+#codehead .chip.forfeit { background: var(--red); color: var(--paper); }
 #codehead .chip.scripted { background: var(--paper-dim); }
 #codehead .chip.fault {
   background: var(--red);

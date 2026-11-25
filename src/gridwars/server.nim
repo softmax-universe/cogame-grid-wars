@@ -27,6 +27,7 @@
 ##   game -> player: {"type":"turn","round":N,"observation":str,
 ##                   "timeout_ms":N}
 ##   player -> game: {"type":"submission","round":N,"action":{...}}
+##                   {"type":"forfeit","round":N,"reason":str}
 
 import
   std/[json, locks, os, sets, strutils, tables, times],
@@ -218,78 +219,70 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
     while true:
       var seats: seq[int]
       var currentRound = 0
-      var forceFallback = false
       withLock stateLock:
         if state.sim.done:
           break
         if playDeadline > 0.0 and
             epochTime() + RoundReserveSeconds > playDeadline:
-          if state.sim.roundsPlayed > 0:
-            echo "grid-wars: episode deadline reached after ",
-              state.sim.roundsPlayed, "/", config.rounds,
-              " rounds; ending early"
-            state.sim.endEarly()
-            state.broadcastLocked()
-            break
-          ## Nothing has been played at all: run ONE round on the fallback
-          ## warriors (no LLM, ~30 ms) so the replay is never empty, then
-          ## settle with reason = "deadline".
-          echo "grid-wars: deadline before the first round; playing one " &
-            "fallback round"
-          forceFallback = true
+          echo "grid-wars: episode deadline reached after ",
+            state.sim.roundsPlayed, "/", config.rounds,
+            " rounds; ending early"
+          state.sim.endEarly()
+          state.broadcastLocked()
+          break
         seats = state.sim.pendingSeats()
         currentRound = state.sim.round
         echo "grid-wars: round ", state.sim.round, " of ", config.rounds,
           " at ", (epochTime() - gameStart).int, "s"
 
-      var decisions: seq[Submission]
-      if forceFallback:
-        for _ in seats:
-          decisions.add(fallbackSubmission("episode deadline"))
-      else:
-        let decisionDeadline = epochTime() +
-          config.actionTimeoutSeconds.float
-        var waitingSeats: seq[int]
+      let decisionDeadline = epochTime() +
+        config.actionTimeoutSeconds.float
+      var waitingSeats: seq[int]
+      withLock stateLock:
+        state.pendingRound = currentRound
+        state.pendingSubmissions.clear()
+        for seat in seats:
+          if state.playerSockets.hasKey(seat):
+            state.playerSockets[seat].send($ %*{
+              "type": "turn",
+              "round": currentRound,
+              "timeout_ms": config.actionTimeoutSeconds * 1000,
+              "observation": state.sim.seatObservation(seat),
+              "prompt_config": {"promptVariant": $state.selection.variant, "promptSeed": state.selection.seed},
+              "prompt_selection": state.selection.selectionMetadata(),
+              "system": state.selection.ordinarySystemPrompt()
+            })
+            waitingSeats.add(seat)
+      while waitingSeats.len > 0 and epochTime() < decisionDeadline:
+        var resolved = 0
         withLock stateLock:
-          state.pendingRound = currentRound
-          state.pendingSubmissions.clear()
-          for seat in seats:
-            if state.playerSockets.hasKey(seat):
-              state.playerSockets[seat].send($ %*{
-                "type": "turn",
-                "round": currentRound,
-                "timeout_ms": config.actionTimeoutSeconds * 1000,
-                "observation": state.sim.seatObservation(seat),
-                "prompt_config": {"promptVariant": $state.selection.variant, "promptSeed": state.selection.seed},
-                "prompt_selection": state.selection.selectionMetadata(),
-                "system": state.selection.ordinarySystemPrompt()
-              })
-              waitingSeats.add(seat)
-        while waitingSeats.len > 0 and epochTime() < decisionDeadline:
-          var received = 0
-          withLock stateLock:
-            for seat in waitingSeats:
-              if state.pendingSubmissions.hasKey(seat):
-                received.inc
-          if received == waitingSeats.len:
-            break
-          sleep(20)
-        decisions = newSeq[Submission](seats.len)
-        withLock stateLock:
-          for index, seat in seats:
-            if state.pendingSubmissions.hasKey(seat):
-              decisions[index] = state.pendingSubmissions[seat]
-            else:
-              echo "grid-wars: seat ", seat,
-                " using sentry fallback"
-              decisions[index] = fallbackSubmission("missing player action")
-          state.pendingRound = -1
+          for seat in waitingSeats:
+            if state.pendingSubmissions.hasKey(seat) or
+                not state.playerSockets.hasKey(seat):
+              resolved.inc
+        if resolved == waitingSeats.len:
+          break
+        sleep(20)
+      var decisions = newSeq[Submission](seats.len)
+      withLock stateLock:
+        for index, seat in seats:
+          if state.pendingSubmissions.hasKey(seat):
+            decisions[index] = state.pendingSubmissions[seat]
+          else:
+            let reason =
+              if state.playerSockets.hasKey(seat): "submission timed out"
+              else: "player disconnected"
+            echo "grid-wars: seat ", seat, " forfeited round ", currentRound,
+              " (", reason, ")"
+            decisions[index] = forfeitSubmission(reason)
+        state.pendingRound = -1
 
       var accepted = newSeq[bool](seats.len)
       withLock stateLock:
         for index, seat in seats:
           let decision = decisions[index]
-          accepted[index] = decision.origin != "fallback"
+          accepted[index] =
+            decision.origin != "forfeit" and decision.rejected.len == 0
           echo "grid-wars: round ", state.sim.round, " ",
             state.sim.names[seat], " submits ", decision.script.len,
             " lines (", decision.origin, ") at ",
@@ -299,25 +292,22 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               decision.banner, decision.origin, decision.rejected)
           except GridWarsError as error:
             echo "grid-wars: submission rejected (", error.msg,
-              "); using the fallback warrior"
-            let fallback = fallbackSubmission(error.msg)
-            state.sim.submit(seat, fallback.script, "", "", "fallback",
-              error.msg)
+              "); forfeiting round"
+            let forfeit = forfeitSubmission(error.msg)
+            state.sim.submit(seat, forfeit.script, "", "", forfeit.origin,
+              forfeit.rejected)
+            decisions[index] = forfeit
             accepted[index] = false
         state.broadcastLocked()
         for index, seat in seats:
-          if state.playerSockets.hasKey(seat) and
-              not forceFallback:
-            state.playerSockets[seat].send($ %*{
+          if state.playerSockets.hasKey(seat):
+            var ack = %*{
               "type": "submission_result", "round": currentRound,
               "accepted": accepted[index]
-            })
-
-      if forceFallback:
-        withLock stateLock:
-          state.sim.endEarly()
-          state.broadcastLocked()
-        break
+            }
+            if not accepted[index] and decisions[index].rejected.len > 0:
+              ack["error"] = %decisions[index].rejected
+            state.playerSockets[seat].send($ack)
 
       if not state.sim.done and config.roundDelayMs > 0:
         sleep(config.roundDelayMs)
@@ -430,23 +420,45 @@ proc websocketHandler(
         return
       try:
         let payload = parseJson(message.data)
-        if payload{"type"}.getStr() == "submission":
+        case payload{"type"}.getStr()
+        of "submission":
           let round = payload["round"].getInt()
-          let action = payload["action"]
-          if action.kind != JObject:
-            raise newException(GridWarsError,
-              "submission action must be an object")
           withLock stateLock:
             if round == state.pendingRound and
                 not state.pendingSubmissions.hasKey(slot):
-              var submission = parseSubmission(action)
-              let source = payload{"source"}.getStr("player")
-              if source notin ["player", "scripted", "fallback"]:
-                raise newException(GridWarsError, "unknown submission source")
-              submission.origin = source
-              state.pendingSubmissions[slot] = submission
+              try:
+                let action = payload{"action"}
+                if action.isNil or action.kind != JObject:
+                  raise newException(GridWarsError,
+                    "submission action must be an object")
+                let source = payload{"source"}.getStr("player")
+                if source notin ["player", "scripted"]:
+                  raise newException(GridWarsError,
+                    "unknown submission source: " & source)
+                var submission = parseSubmission(action)
+                submission.origin = source
+                state.pendingSubmissions[slot] = submission
+              except CatchableError as error:
+                echo "grid-wars: seat ", slot, " submission rejected: ", error.msg
+                state.pendingSubmissions[slot] = forfeitSubmission(error.msg)
+        of "forfeit":
+          let round = payload["round"].getInt()
+          let reason = payload{"reason"}.getStr("player forfeit")
+          withLock stateLock:
+            if round == state.pendingRound and
+                not state.pendingSubmissions.hasKey(slot):
+              echo "grid-wars: seat ", slot, " forfeited round ", round,
+                ": ", reason
+              state.pendingSubmissions[slot] = forfeitSubmission(reason)
+        else:
+          discard
       except CatchableError as error:
-        echo "grid-wars: ignoring bad player frame: ", error.msg
+        echo "grid-wars: bad player frame from seat ", slot, ": ", error.msg
+        withLock stateLock:
+          if state.pendingRound >= 0 and
+              not state.pendingSubmissions.hasKey(slot):
+            state.pendingSubmissions[slot] = forfeitSubmission(
+              "malformed player frame: " & error.msg)
     of ErrorEvent:
       discard
     of CloseEvent:

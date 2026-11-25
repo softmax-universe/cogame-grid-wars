@@ -75,11 +75,11 @@ A player policy submits one JSON action through the socket:
  "banner": "one line the spectators see"}
 ```
 
-`script` is canonically an ARRAY OF LINES — that removes the single most common JSON failure, a literal newline inside a string — but a single string with newlines is accepted, markdown fences are stripped, and trailing prose after the closing brace is ignored. `script` is capped at 120 lines of 100 characters and 4000 characters in total, `notes` at 600 characters and `banner` at 80, all cut on rune boundaries. The game compiles every submitted program. An invalid or missing action uses the built-in `sentry` warrior for that round and increments `results.fallbacks`.
+`script` must be a JSON ARRAY OF LINES (each element one source line); `notes` and `banner` are optional strings defaulting to `""`. A model reply must contain exactly one JSON object, bare or inside a single outer Markdown code fence (` ```json ` or ` ``` `); surrounding prose, extra objects, and alternative legacy script formats are rejected. `script` is capped at 120 lines of 100 characters and 4000 characters in total, `notes` at 600 characters and `banner` at 80, all cut on rune boundaries. The game compiles every submitted program. An invalid, missing, or timed-out action forfeits that round (the warrior halts with an empty program; no fallback warrior is substituted) and increments `results.fallbacks`.
 
 ## The three shipped warriors
 
-`PLAYER_SCRIPTED=painter|bomber|sentry` seats one of these instead of an LLM. They are also the no-credentials fallback, which is why offline certification always completes.
+`PLAYER_SCRIPTED=painter|bomber|sentry` seats one of these scripted baselines instead of an LLM.
 
 ### painter — claim ground, turn away from walls, bomb a rival that leans in
 

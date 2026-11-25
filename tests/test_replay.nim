@@ -87,11 +87,11 @@ suite "artifacts":
         ## An em dash outside a comment: the lexer quotes the character.
         sim.submit(seat, @["var a = 1", "var b = 2 \u2014 3"], "", "", "llm")
       else:
-        ## A fallback carrying a long multi-byte rejection, cut at the cap.
-        let fallback = fallbackSubmission(
-          "no JSON object in response: " & noisy(40))
-        sim.submit(seat, fallback.script, fallback.notes, fallback.banner,
-          fallback.origin, fallback.rejected)
+        ## A forfeit carrying a long multi-byte rejection, cut at the cap.
+        let forfeit = forfeitSubmission(
+          "invalid JSON object in response: " & noisy(40))
+        sim.submit(seat, forfeit.script, forfeit.notes, forfeit.banner,
+          forfeit.origin, forfeit.rejected)
     let raw = $sim.replayJson()
     check raw.validateUtf8() == -1
     var captured = 0
@@ -105,6 +105,9 @@ suite "artifacts":
       check message.validateUtf8() == -1
       if event["seat"].getInt() == 0:
         quotedDash = "\u2014" in message
+      else:
+        check event["origin"].getStr() == "forfeit"
+        check event["script"].len == 0
       inc captured
     check captured == Seats
     check quotedDash

@@ -33,10 +33,11 @@ as a private observation. Each player writes a complete GWL program. The game
 compiles and seals all four before battle, then owns execution, results, and
 replay. The [ordinary player](players/ordinary/README.md) supports canned
 and trained adapter backends. The bundled player supports prompt and
-scripted programs. Missing or invalid actions use the sentry fallback.
+scripted programs. Missing or invalid actions forfeit that round with no
+fallback warrior substituted.
 
 Three shipped warriors are `painter` (claim ground and turn around walls),
-`bomber` (mine the ground behind it), and `sentry` (the fallback). Prompt
+`bomber` (mine the ground behind it), and `sentry` (the round-1 seed warrior). Prompt
 model calls use player-owned credentials; the game receives none.
 
 ```bash

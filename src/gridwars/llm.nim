@@ -6,7 +6,7 @@
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no player credential the bundled prompt policy sends sentry fallback.
+## With no player credential the bundled prompt policy forfeits the round.
 
 import
   std/[json, os, strutils, unicode],
@@ -35,8 +35,8 @@ type
     script*: seq[string]
     notes*: string      ## "" when the reply carried none
     banner*: string
-    origin*: string     ## "llm" | "retry" | "fallback" | "scripted"
-    rejected*: string   ## fallback only: why the seat's own reply was refused
+    origin*: string     ## "llm" | "player" | "scripted" | "forfeit"
+    rejected*: string   ## forfeit only: why the seat's reply was refused or missing
 
   LlmTransport = enum
     ltNone, ltSidecar, ltBedrock, ltAnthropic
@@ -145,7 +145,7 @@ proc newLlmClient*(maxOutputTokens: int, model: string): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "grid-wars llm: no LLM credentials; using scripted warriors"
+    echo "grid-wars llm: no LLM credentials; prompt turns will forfeit"
 
 # ---- Scripted baselines -----------------------------------------------------
 
@@ -169,9 +169,9 @@ proc submissionJson*(submission: Submission): JsonNode =
   %*{"script": submission.script, "notes": submission.notes,
     "banner": submission.banner}
 
-proc fallbackSubmission*(compileError: string): Submission =
-  Submission(script: warriorLines(skSentry), origin: "fallback",
-    rejected: cleanText(compileError, 300))
+proc forfeitSubmission*(reason: string): Submission =
+  Submission(script: @[], origin: "forfeit",
+    rejected: cleanText(reason, 300))
 
 # ---- Prompts ----------------------------------------------------------------
 
@@ -302,91 +302,64 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
 
 # ---- Reply parsing ----------------------------------------------------------
 
-proc stripFences*(text: string): string =
-  ## Drops a leading UTF-8 BOM and a wrapping markdown fence, whatever
-  ## language tag it carries.
+proc stripOuterFence(text: string): string =
+  ## Drops a leading UTF-8 BOM and at most one ordinary outer Markdown code
+  ## fence (plain or `json`-tagged). Rejects unsupported fence tags or text
+  ## outside the fence.
   result = strutils.strip(text)
   if result.len >= 3 and result[0 .. 2] == "\xEF\xBB\xBF":
     result = strutils.strip(result[3 .. ^1])
   if result.startsWith("```"):
     let firstBreak = result.find('\n')
-    if firstBreak >= 0:
-      result = result[firstBreak + 1 .. ^1]
-    else:
-      result = result[3 .. ^1]
-    let closing = result.rfind("```")
-    if closing >= 0:
-      result = result[0 ..< closing]
-  result = strutils.strip(result)
+    if firstBreak < 0:
+      raise newException(GridWarsError,
+        "unterminated markdown fence in response")
+    let tag = result[3 ..< firstBreak].strip().toLowerAscii()
+    if tag.len > 0 and tag != "json":
+      raise newException(GridWarsError,
+        "unsupported markdown fence language tag: " & tag)
+    let body = result[firstBreak + 1 .. ^1]
+    if not body.endsWith("```"):
+      raise newException(GridWarsError,
+        "trailing text after closing markdown fence")
+    let inner = body[0 ..< body.len - 3]
+    let beforeClose = inner.strip(leading = false, chars = {' ', '\t', '\r'})
+    if beforeClose.len > 0 and beforeClose[^1] != '\n':
+      raise newException(GridWarsError,
+        "closing markdown fence must be on its own line")
+    result = inner.strip()
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first balanced {...} object out of a model response, tolerating
-  ## UTF-8 BOM, markdown fences, and trailing prose containing braces.
-  let cleaned = stripFences(text)
-  let start = cleaned.find('{')
-  if start < 0:
-    let head = cutRunes(cleaned.strip(), 160)
-    raise newException(GridWarsError, "no JSON object in response: " &
-      head.replace("\n", " "))
-  var depth = 0
-  var inString = false
-  var escaped = false
-  var stop = -1
-  for index in start ..< cleaned.len:
-    let ch = cleaned[index]
-    if inString:
-      if escaped:
-        escaped = false
-      elif ch == '\\':
-        escaped = true
-      elif ch == '"':
-        inString = false
-      continue
-    case ch
-    of '"': inString = true
-    of '{': depth += 1
-    of '}':
-      depth -= 1
-      if depth == 0:
-        stop = index
-    else: discard
-    if stop >= 0:
-      break
-  if stop < 0:
-    let head = cutRunes(cleaned.strip(), 160)
-    raise newException(GridWarsError, "unbalanced JSON object in response: " &
-      head.replace("\n", " "))
-  parseJson(cleaned[start .. stop])
+  ## Parses exactly one JSON object, bare or inside a single ordinary outer
+  ## Markdown code fence (JSON-tagged or plain). Rejects surrounding prose,
+  ## extra JSON objects, and non-object JSON values.
+  let cleaned = stripOuterFence(text)
+  if cleaned.len == 0:
+    raise newException(GridWarsError, "empty JSON response")
+  try:
+    result = parseJson(cleaned)
+  except JsonParsingError:
+    let head = cutRunes(cleaned.replace("\n", " "), 160)
+    raise newException(GridWarsError,
+      "invalid JSON object in response: " & head)
+  if result.kind != JObject:
+    raise newException(GridWarsError, "response JSON must be an object")
 
 proc normaliseScript*(node: JsonNode): seq[string] =
-  ## The array-of-lines form is canonical because it removes the single
-  ## most common JSON failure — a literal newline inside a JSON string —
-  ## but the string form is accepted, and a fence inside the value is
-  ## stripped either way.
+  ## Validates the canonical array-of-lines `script` field.
   if node.isNil or node.kind == JNull:
     raise newException(GridWarsError, "no script in response")
-  var raw: seq[string]
-  case node.kind
-  of JArray:
-    for item in node:
-      if item.kind == JString:
-        for piece in item.getStr().split('\n'):
-          raw.add(piece)
-      else:
-        raise newException(GridWarsError,
-          "script must be an array of source lines")
-  of JString:
-    for piece in stripFences(node.getStr()).split('\n'):
-      raw.add(piece)
-  else:
+  if node.kind != JArray:
     raise newException(GridWarsError,
       "script must be an array of source lines")
-  ## A fence may wrap the whole array too.
-  while raw.len > 0 and raw[0].strip().startsWith("```"):
-    raw.delete(0)
-  while raw.len > 0 and raw[^1].strip().startsWith("```"):
-    discard raw.pop()
-  for line in raw:
+  for item in node:
+    if item.kind != JString:
+      raise newException(GridWarsError,
+        "script must be an array of source lines")
+    let line = item.getStr()
+    if '\n' in line:
+      raise newException(GridWarsError,
+        "script array elements must be single source lines")
     var text = line.replace("\t", "  ").replace("\r", "")
     while text.len > 0 and text[^1] == ' ':
       text.setLen(text.len - 1)
@@ -397,13 +370,22 @@ proc normaliseScript*(node: JsonNode): seq[string] =
     raise newException(GridWarsError, "the script is empty")
 
 proc parseSubmission*(payload: JsonNode): Submission =
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
-  result.banner = cleanText(payload{"banner"}.getStr().replace("\n", " "),
-    MaxBannerLen)
+  if payload.isNil or payload.kind != JObject:
+    raise newException(GridWarsError, "submission action must be a JSON object")
+  for key, _ in payload.pairs:
+    if key notin ["script", "notes", "banner"]:
+      raise newException(GridWarsError, "unexpected submission field: " & key)
+  if payload.hasKey("notes"):
+    if payload["notes"].kind != JString:
+      raise newException(GridWarsError, "notes must be a string")
+    result.notes = cleanText(payload["notes"].getStr(), MaxNotesLen)
+  if payload.hasKey("banner"):
+    if payload["banner"].kind != JString:
+      raise newException(GridWarsError, "banner must be a string")
+    result.banner = cleanText(payload["banner"].getStr().replace("\n", " "),
+      MaxBannerLen)
   result.script = capScript(normaliseScript(payload{"script"}))
   result.origin = "llm"
-  ## Compile here so the retry can carry the compiler's own message —
-  ## the single most valuable feedback in the game, and it is specific.
   discard compile(result.script)
 
 # ---- Transport --------------------------------------------------------------

@@ -12,6 +12,34 @@ import websocket
 from capture import Capture
 
 
+def parse_json_object(text: str) -> dict:
+    """Parse one JSON object, bare or inside one outer Markdown code fence."""
+    cleaned = text.strip()
+    if cleaned.startswith("\ufeff"):
+        cleaned = cleaned[1:].strip()
+    if cleaned.startswith("```"):
+        first_break = cleaned.find("\n")
+        if first_break < 0:
+            raise ValueError("unterminated markdown fence in response")
+        tag = cleaned[3:first_break].strip().lower()
+        if tag not in ("", "json"):
+            raise ValueError(f"unsupported markdown fence language tag: {tag}")
+        body = cleaned[first_break + 1 :]
+        if not body.endswith("```"):
+            raise ValueError("trailing text after closing markdown fence")
+        inner = body[:-3]
+        before_close = inner.rstrip(" \t\r")
+        if before_close and not before_close.endswith("\n"):
+            raise ValueError("closing markdown fence must be on its own line")
+        cleaned = inner.strip()
+    if not cleaned:
+        raise ValueError("empty JSON response")
+    action = json.loads(cleaned)
+    if not isinstance(action, dict):
+        raise ValueError("trained Grid Wars submission must be a JSON object")
+    return action
+
+
 def choose(turn: dict, generator) -> tuple[dict, str]:
     turn["user"] = turn["observation"] + "\n" + os.environ.get("PLAYER_PROMPT", "")
     warrior_dir = Path(
@@ -24,10 +52,7 @@ def choose(turn: dict, generator) -> tuple[dict, str]:
                 {"role": "user", "content": turn["user"]},
             ]
         )
-        action = json.loads(completion)
-        if not isinstance(action, dict):
-            raise ValueError("trained Grid Wars submission must be a JSON object")
-        return action, "trained"
+        return parse_json_object(completion), "trained"
     return {"script": (warrior_dir / "painter.gwl").read_text().splitlines(), "notes": "", "banner": ""}, "canned"
 
 
@@ -44,7 +69,7 @@ def main() -> None:
     artifact = Capture(slot, backend) if os.environ.get("POC_CAPTURE_TRAINING") == "1" else None
     socket = websocket.create_connection(url, timeout=60)
     socket.settimeout(None)
-    pending: dict[int, tuple[dict, dict, str]] = {}
+    pending: dict[int, tuple[dict, dict | None, str]] = {}
     while True:
         opcode, data = socket.recv_data(control_frame=True)
         if opcode == websocket.ABNF.OPCODE_CLOSE:
@@ -54,14 +79,21 @@ def main() -> None:
         frame = json.loads(data)
         kind = frame["type"]
         if kind == "turn":
-            action, source = choose(frame, generator)
-            pending[frame["round"]] = (frame, action, source)
-            socket.send(
-                json.dumps({"type": "submission", "round": frame["round"], "source": "player", "action": action})
-            )
+            try:
+                action, source = choose(frame, generator)
+            except ValueError as exc:
+                pending[frame["round"]] = (frame, None, "forfeit")
+                socket.send(
+                    json.dumps({"type": "forfeit", "round": frame["round"], "reason": str(exc)})
+                )
+            else:
+                pending[frame["round"]] = (frame, action, source)
+                socket.send(
+                    json.dumps({"type": "submission", "round": frame["round"], "source": "player", "action": action})
+                )
         elif kind == "submission_result":
             turn, action, source = pending.pop(frame["round"])
-            if artifact and frame["accepted"]:
+            if artifact and frame["accepted"] and action is not None:
                 artifact.record(
                     turn["system"],
                     turn["user"],
