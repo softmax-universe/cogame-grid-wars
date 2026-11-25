@@ -275,7 +275,7 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
   result.add("Reply with ONLY {\"script\": [\"line\", \"line\", ...], " &
     "\"notes\": \"…\", \"banner\": \"…\"}. Keep scripts compact (~15-50 " &
     "lines) and notes brief (1-2 sentences) so your JSON never truncates " &
-    "(hard caps: " & $MaxScriptLines & " lines of " & $MaxLineChars &
+    "(hard caps: " & $MaxScriptLines & " lines, " & $MaxScriptChars &
     " characters, notes " & $MaxNotesLen & " characters, banner " &
     $MaxBannerLen & " characters).")
 

@@ -71,7 +71,6 @@ suite "artifacts":
       check event["script"].len <= MaxScriptLines
       var total = 0
       for line in event["script"]:
-        check line.getStr().runeLen <= MaxLineChars
         check line.getStr().validateUtf8() == -1
         total += line.getStr().runeLen + 1
       check total <= MaxScriptChars

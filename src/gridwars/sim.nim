@@ -23,7 +23,6 @@ const
   EnergyCap* = 60
   StepInstructions* = 2000
   MaxScriptLines* = 120
-  MaxLineChars* = 100
   MaxScriptChars* = 4000
   MaxNotesLen* = 600
   MaxBannerLen* = 80

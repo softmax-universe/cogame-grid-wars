@@ -226,16 +226,15 @@ suite "reply parsing":
     let submission = parseSubmission(extractJsonObject(reply))
     check submission.script[1] == "  place()"
 
-  test "over-long lines, 120 lines and 4000 characters are rejected without truncation":
+  test "long valid lines compile and total program limits reject oversized scripts":
     var tooManyLines = newJArray()
     for index in 0 ..< MaxScriptLines + 1:
       tooManyLines.add(%("var v" & $index & " = 1"))
     expect GwlCompileError:
       discard parseSubmission(%*{"script": tooManyLines})
 
-    let tooLongLine = %*{"script": ["# " & repeat("a", MaxLineChars), "while true:", "  place()"]}
-    expect GwlCompileError:
-      discard parseSubmission(tooLongLine)
+    let longLine = %*{"script": ["# " & repeat("a", 160), "while true:", "  place()"]}
+    discard parseSubmission(longLine)
 
     var tooManyChars = newJArray()
     for index in 0 ..< 60:
