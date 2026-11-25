@@ -53,7 +53,7 @@ ACTIONS
   program there; next tick it resumes on the next line.
 
 LIMITS
-  at most 120 lines, 100 characters a line, 4000 characters, 4000 AST
+  at most 120 lines, 4000 characters, 4000 AST
   nodes, 32 procs, blocks nested 8 deep; at most 2000 VM instructions per
   tick (running out is a STALL: the tick counts as wait() and you resume
   where you were), call depth 64, 4096 live array elements.

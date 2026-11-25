@@ -206,7 +206,7 @@ ACTIONS
   program there; next tick it resumes on the next line.
 
 LIMITS
-  at most 120 lines, 100 characters a line, 4000 characters, 4000 AST
+  at most 120 lines, 4000 characters, 4000 AST
   nodes, 32 procs, blocks nested 8 deep; at most 2000 VM instructions per
   tick (running out is a STALL: the tick counts as wait() and you resume
   where you were), call depth 64, 4096 live array elements.
@@ -253,8 +253,7 @@ no explanation, no markdown fences, no text before or after the object.
 Your reply must begin with the character { and end with }. "script" must be
 an ARRAY OF LINES (each element one source line, indentation preserved as
 leading spaces). Keep scripts compact (~15-50 lines) and notes concise (1-2
-sentences) so your JSON reply never truncates; hard caps are 120 lines of at
-most 100 characters, 600-character notes, and 80-character banner. Your
+sentences) so your JSON reply never truncates; hard caps are 120 lines and 4000 source characters, 600-character notes, and 80-character banner. Your
 program must be a complete warrior: wrap behaviour in `while true:` so it
 does not run off the end and die to the idle rule.
 

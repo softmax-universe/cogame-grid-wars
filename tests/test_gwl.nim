@@ -30,7 +30,7 @@ proc faultOf(source: string, ticks = 4): GwlFault =
 
 proc compileError(source: string): string =
   try:
-    discard compile(source.strip().splitLines())
+    discard compile(source.splitLines())
     return ""
   except GwlCompileError as error:
     return error.msg
@@ -493,8 +493,8 @@ suite "compile caps":
       lines.add("var v" & $index & " = " & $index)
     check "120" in compileError(lines.join("\n"))
 
-  test "a line over 100 characters":
-    check "100" in compileError("var a = 1\nvar b = " & repeat("1 + ", 40) & "1\n")
+  test "a long line compiles within the whole program budget":
+    check compileError("var a = 1\nvar b = " & repeat("1 + ", 40) & "1\n") == ""
 
   test "over 4000 characters":
     var lines: seq[string]
